@@ -813,11 +813,10 @@ static void
 MarkNodeHasMetadata(char *nodeName, int32 nodePort, bool hasMetadata)
 {
 	const bool indexOK = false;
-	const int scanKeyCount = 2;
 
 	Relation pgDistNode = NULL;
 	TupleDesc tupleDescriptor = NULL;
-	ScanKeyData scanKey[scanKeyCount];
+	ScanKeyData scanKey[MARKNODE_SCANKEYCOUNT];
 	SysScanDesc scanDescriptor = NULL;
 	HeapTuple heapTuple = NULL;
 	Datum values[Natts_pg_dist_node];
@@ -833,7 +832,7 @@ MarkNodeHasMetadata(char *nodeName, int32 nodePort, bool hasMetadata)
 				BTEqualStrategyNumber, F_INT8EQ, Int32GetDatum(nodePort));
 
 	scanDescriptor = systable_beginscan(pgDistNode, InvalidOid, indexOK,
-										NULL, scanKeyCount, scanKey);
+										NULL, MARKNODE_SCANKEYCOUNT, scanKey);
 
 	heapTuple = systable_getnext(scanDescriptor);
 	if (!HeapTupleIsValid(heapTuple))

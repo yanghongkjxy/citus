@@ -56,5 +56,7 @@ extern void CreateTableMetadataOnWorkers(Oid relationId);
 	"shardlength = EXCLUDED.shardlength, " \
 	"groupid = EXCLUDED.groupid"
 
+#define MARKNODE_SCANKEYCOUNT 2
+
 
 #endif /* METADATA_SYNC_H */
