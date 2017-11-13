@@ -74,6 +74,8 @@ static void PlanPullPushCTEs(Query *query, List **subPlanList);
 static bool CteReferenceListWalker(Node *node, struct CteReferenceWalkerContext *context);
 static void PlanPullPushSubqueries(Query *query, List **subPlanList);
 static bool PlanPullPushSubqueriesWalker(Node *node, List **planList);
+static bool ContainsReferencesToOuterQuery(Node *node);
+static bool ContainsReferencesToOuterQueryWalker(Node *node, void *context);
 static Query * BuildSubPlanResultQuery(Query *subquery, int subPlanId);
 static void RemoveRTEsFromPlannerRestrictionContext(List *rangeTableList);
 static bool RangeTableListContainsIdentity(List *rangeTableList, int rteIdentity);
@@ -842,6 +844,11 @@ PlanPullPushSubqueriesWalker(Node *node, List **subPlanList)
 		StringInfo s = makeStringInfo();
 		pg_get_query_def(query, s);
 
+		if (ContainsReferencesToOuterQuery((Node *) query))
+		{
+			return false;
+		}
+
 		pushdownError = DeferErrorIfCannotPushdownSubquery(query, false);
 		if (pushdownError != NULL)
 		{
@@ -853,6 +860,7 @@ PlanPullPushSubqueriesWalker(Node *node, List **subPlanList)
 
 			StringInfo r = makeStringInfo();
 			pg_get_query_def(resultQuery, r);
+
 			elog(DEBUG1, "replacing subquery %s with: %s", s->data, r->data);
 
 			subPlan = planner(copyObject(query), 0, NULL);
@@ -868,6 +876,48 @@ PlanPullPushSubqueriesWalker(Node *node, List **subPlanList)
 		return expression_tree_walker(node, PlanPullPushSubqueriesWalker, subPlanList);
 	}
 }
+
+
+static bool
+ContainsReferencesToOuterQuery(Node *node)
+{
+	return ContainsReferencesToOuterQueryWalker(node, NULL);
+}
+
+
+static bool
+ContainsReferencesToOuterQueryWalker(Node *node, void *context)
+{
+	if (node == NULL)
+	{
+		return false;
+	}
+
+	if (IsA(node, Var))
+	{
+		if (((Var *) node)->varlevelsup > 0)
+		{
+			return true;
+		}
+		return false;
+	}
+
+	if (IsA(node, CurrentOfExpr))
+	{
+		return true;
+	}
+
+	if (IsA(node, PlaceHolderVar))
+	{
+		if (((PlaceHolderVar *) node)->phlevelsup > 0)
+		{
+			return true;
+		}
+	}
+
+	return expression_tree_walker(node, ContainsReferencesToOuterQueryWalker, context);
+}
+
 
 
 static Query *
