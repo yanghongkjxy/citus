@@ -1730,7 +1730,8 @@ PlanRouterQuery(Query *originalQuery, RelationRestrictionContext *restrictionCon
 		List *workerNodeList = ActiveReadableNodeList();
 		if (workerNodeList != NIL)
 		{
-			WorkerNode *workerNode = (WorkerNode *) linitial(workerNodeList);
+			uint32 randomWorkerIndex = random() % list_length(workerNodeList);
+			WorkerNode *workerNode = list_nth(workerNodeList, randomWorkerIndex);
 			ShardPlacement *dummyPlacement =
 				(ShardPlacement *) CitusMakeNode(ShardPlacement);
 			dummyPlacement->nodeName = workerNode->workerName;
