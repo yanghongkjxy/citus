@@ -81,7 +81,6 @@ typedef struct PlanPullPushContext
 } PlanPullPushContext;
 
 
-
 /* local function forward declarations */
 static bool NeedsDistributedPlanningWalker(Node *node, void *context);
 static PlannedStmt * CreateDistributedPlan(PlannedStmt *localPlan, Query *originalQuery,
@@ -420,7 +419,7 @@ static void
 AssignRTEIdentity(RangeTblEntry *rangeTableEntry, int rteIdentifier)
 {
 	Assert(rangeTableEntry->rtekind == RTE_RELATION);
-	Assert(rangeTableEntry->values_lists == NIL);
+	/* Assert(rangeTableEntry->values_lists == NIL); */
 
 	rangeTableEntry->values_lists = list_make1_int(rteIdentifier);
 }
@@ -796,6 +795,31 @@ PlanPullPushSubqueries(Query *query, PlanPullPushContext *context)
 			!SafeToPushdownUnionSubquery(filteredRestrictionContext))
 		{
 			RecursivelyPlanSetOperations(query, context);
+		}
+	}
+
+	else
+	{
+		PlannerRestrictionContext *filteredPlannerRestriction =
+			FilterPlannerRestrictionForQuery((*context).plannerRestrictionContext,
+											 query);
+		if (!RestrictionEquivalenceForPartitionKeys(filteredPlannerRestriction))
+		{
+			List *rangeTableEntries = query->rtable;
+			ListCell *rangeTableCell = NULL;
+			foreach(rangeTableCell, rangeTableEntries)
+			{
+				RangeTblEntry *rte = lfirst(rangeTableCell);
+
+				if (rte->rtekind == RTE_SUBQUERY && !ContainsResultFunction(
+						(Node *) rte->subquery))
+				{
+					Query *subquery = rte->subquery;
+					int subPlanId = list_length(context->subPlanList);
+					PlannedStmt *subPlan = RecursivelyPlanQuery(subquery, subPlanId);
+					context->subPlanList = lappend(context->subPlanList, subPlan);
+				}
+			}
 		}
 	}
 
