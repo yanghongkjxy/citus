@@ -142,12 +142,19 @@ static Index RelationRestrictionPartitionKeyIndex(RelationRestriction *
  * safe to push down, the function would fail to return true.
  */
 bool
-SafeToPushdownUnionSubquery(RelationRestrictionContext *restrictionContext)
+SafeToPushdownUnionSubquery(PlannerRestrictionContext *plannerRestrictionContext)
 {
+	RelationRestrictionContext *restrictionContext =
+		plannerRestrictionContext->relationRestrictionContext;
+	JoinRestrictionContext *joinRestrictionContext =
+		plannerRestrictionContext->joinRestrictionContext;
 	Index unionQueryPartitionKeyIndex = 0;
 	AttributeEquivalenceClass *attributeEquivalance =
 		palloc0(sizeof(AttributeEquivalenceClass));
 	ListCell *relationRestrictionCell = NULL;
+	List *relationRestrictionAttributeEquivalenceList = NIL;
+	List *joinRestrictionAttributeEquivalenceList = NIL;
+	List *allAttributeEquivalenceList = NIL;
 
 	attributeEquivalance->equivalenceId = attributeEquivalenceId++;
 
@@ -192,7 +199,7 @@ SafeToPushdownUnionSubquery(RelationRestrictionContext *restrictionContext)
 			/* union does not have partition key in the target list */
 			if (partitionKeyIndex == 0)
 			{
-				return false;
+				continue;
 			}
 		}
 		else
@@ -203,13 +210,13 @@ SafeToPushdownUnionSubquery(RelationRestrictionContext *restrictionContext)
 			/* union does not have partition key in the target list */
 			if (partitionKeyIndex == 0)
 			{
-				return false;
+				continue;
 			}
 
 			targetEntryToAdd = list_nth(targetList, partitionKeyIndex - 1);
 			if (!IsA(targetEntryToAdd->expr, Var))
 			{
-				return false;
+				continue;
 			}
 
 			varToBeAdded = (Var *) targetEntryToAdd->expr;
@@ -222,7 +229,7 @@ SafeToPushdownUnionSubquery(RelationRestrictionContext *restrictionContext)
 		 */
 		if (partitionKeyIndex == InvalidAttrNumber)
 		{
-			return false;
+			continue;
 		}
 
 		/*
@@ -236,14 +243,25 @@ SafeToPushdownUnionSubquery(RelationRestrictionContext *restrictionContext)
 		}
 		else if (unionQueryPartitionKeyIndex != partitionKeyIndex)
 		{
-			return false;
+			continue;
 		}
 
 		AddToAttributeEquivalenceClass(&attributeEquivalance, relationPlannerRoot,
 									   varToBeAdded);
 	}
 
-	return EquivalenceListContainsRelationsEquality(list_make1(attributeEquivalance),
+	relationRestrictionAttributeEquivalenceList =
+		GenerateAttributeEquivalencesForRelationRestrictions(restrictionContext);
+	joinRestrictionAttributeEquivalenceList =
+		GenerateAttributeEquivalencesForJoinRestrictions(joinRestrictionContext);
+
+	allAttributeEquivalenceList =
+		list_concat(relationRestrictionAttributeEquivalenceList,
+					joinRestrictionAttributeEquivalenceList);
+
+	allAttributeEquivalenceList = lappend(allAttributeEquivalenceList, attributeEquivalance);
+
+	return EquivalenceListContainsRelationsEquality(allAttributeEquivalenceList,
 													restrictionContext);
 }
 

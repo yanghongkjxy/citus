@@ -627,8 +627,6 @@ DeferErrorIfUnsupportedSubqueryPushdown(Query *originalQuery,
 	ListCell *subqueryCell = NULL;
 	List *subqueryList = NIL;
 	DeferredErrorMessage *error = NULL;
-	RelationRestrictionContext *relationRestrictionContext =
-		plannerRestrictionContext->relationRestrictionContext;
 
 	if (originalQuery->limitCount != NULL)
 	{
@@ -643,7 +641,7 @@ DeferErrorIfUnsupportedSubqueryPushdown(Query *originalQuery,
 	 */
 	if (ContainsUnionSubquery(originalQuery))
 	{
-		if (!SafeToPushdownUnionSubquery(relationRestrictionContext))
+		if (!SafeToPushdownUnionSubquery(plannerRestrictionContext))
 		{
 			return DeferredError(ERRCODE_FEATURE_NOT_SUPPORTED,
 								 "cannot pushdown the subquery since all leaves of "
