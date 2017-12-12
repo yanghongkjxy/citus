@@ -117,6 +117,12 @@ static bool ContainsReferencesToOuterQueryWalker(Node *node,
 												 VarLevelsUpWalkerContext *context);
 static Query * BuildSubPlanResultQuery(Query *subquery, uint64 planId, uint32 subPlanId);
 
+static bool
+PlanPullPushSubqueriesWalker(Node *node, RecursivePlanningContext *context);
+static bool ShouldRecursivelyPlanSubquery(Query *query,
+										  RecursivePlanningContext *context);
+static void
+RecursivelyPlanQuery(Query *query, RecursivePlanningContext *context);
 
 /*
  * RecursivelyPlanSubqueriesAndCTEs finds subqueries and CTEs that cannot be pushed down to
@@ -166,11 +172,135 @@ RecursivelyPlanSubqueriesAndCTEs(Query *query,
 		return error;
 	}
 
-	/* XXX: plan subqueries */
+	/* descend into subqueries */
+	query_tree_walker(query, PlanPullPushSubqueriesWalker, &context, 0);
+
 
 	*subPlanList = context.subPlanList;
 
 	return NULL;
+}
+
+
+static bool
+PlanPullPushSubqueriesWalker(Node *node, RecursivePlanningContext *context)
+{
+	if (node == NULL)
+	{
+		return false;
+	}
+
+	if (IsA(node, Query))
+	{
+		Query *query = (Query *) node;
+
+		context->level += 1;
+		RecursivelyPlanSubqueriesAndCTEs(query, context->plannerRestrictionContext, context->planId, &(context->subPlanList));
+		context->level -= 1;
+
+		if (ShouldRecursivelyPlanSubquery(query, context))
+		{
+			RecursivelyPlanQuery(query, context);
+		}
+
+		return false;
+	}
+
+	return expression_tree_walker(node, PlanPullPushSubqueriesWalker, context);
+}
+
+
+/*
+ * RecursivelyPlanQuery recursively plans a query, replaces it with a
+ * result query and returns the subplan.
+ */
+static void
+RecursivelyPlanQuery(Query *query, RecursivePlanningContext *context)
+{
+	uint64 planId = context->planId;
+	int subPlanId = list_length(context->subPlanList);
+
+	DistributedSubPlan *subPlan = CitusMakeNode(DistributedSubPlan);
+
+	Query *resultQuery = NULL;
+	int cursorOptions = 0;
+
+	resultQuery = BuildSubPlanResultQuery(query, planId, subPlanId);
+
+	if (log_min_messages >= DEBUG1)
+	{
+		StringInfo subqueryString = makeStringInfo();
+		StringInfo resultQueryString = makeStringInfo();
+
+		pg_get_query_def(query, subqueryString);
+		pg_get_query_def(resultQuery, resultQueryString);
+
+		elog(DEBUG1, "replacing subquery %s --> %s", subqueryString->data,
+			 resultQueryString->data);
+	}
+
+	if (ContainsReadIntermediateResultFunction((Node *) query))
+	{
+		cursorOptions |= CURSOR_OPT_FORCE_DISTRIBUTED;
+	}
+
+	/* we want to be able to handle queries with only intermediate results */
+	if (!EnableRouterExecution)
+	{
+		ereport(ERROR, (errmsg("cannot handle complex subqueries when the "
+							   "router executor is disabled")));
+	}
+
+
+	subPlan = CreateDistributedSubPlan(subPlanId, query, NULL);
+	context->subPlanList = lappend(context->subPlanList, subPlan);
+
+	memcpy(query, resultQuery, sizeof(Query));
+}
+
+static bool
+ShouldRecursivelyPlanSubquery(Query *query, RecursivePlanningContext *context)
+{
+	bool shouldRecursivelyPlan = false;
+	DeferredErrorMessage *pushdownError = NULL;
+
+	if (ContainsReferencesToOuterQuery(query))
+	{
+		/* cannot plan correlated subqueries by themselves */
+		if (log_min_messages >= DEBUG1)
+		{
+			/* we cannot deparse queries with references to outer queries */
+			elog(DEBUG1, "Subquery includes reference to outer queries, "
+						 "thus not being recursively planned");
+		}
+
+		return false;
+	}
+
+	pushdownError = DeferErrorIfCannotPushdownSubquery(query, false);
+	if (pushdownError != NULL)
+	{
+		if (!NeedsDistributedPlanning(query))
+		{
+			/* postgres can always plan queries that don't require distributed planning */
+			shouldRecursivelyPlan = true;
+		}
+		/*else if (TaskExecutorType == MULTI_EXECUTOR_TASK_TRACKER &&
+				 SingleRelationRepartitionSubquery(query))
+		{
+			/* we could plan this subquery through re-partitioning */
+		//}
+		else
+		{
+			if (DeferErrorIfQueryNotSupported(query) == NULL)
+			{
+				/* Citus can plan this distribute (sub)query */
+				shouldRecursivelyPlan = true;
+			}
+		}
+	}
+
+	return shouldRecursivelyPlan;
 }
 
 

@@ -21,6 +21,7 @@
 #include "commands/defrem.h"
 #include "distributed/citus_clauses.h"
 #include "distributed/colocation_utils.h"
+#include "distributed/errormessage.h"
 #include "distributed/metadata_cache.h"
 #include "distributed/insert_select_planner.h"
 #include "distributed/multi_logical_optimizer.h"
@@ -99,9 +100,6 @@ static bool RangeTableArrayContainsAnyRTEIdentities(RangeTblEntry **rangeTableEn
 static Relids QueryRteIdentities(Query *queryTree);
 static DeferredErrorMessage * DeferErrorIfUnsupportedSublinkAndReferenceTable(
 	Query *queryTree);
-static DeferredErrorMessage * DeferErrorIfCannotPushdownSubquery(Query *subqueryTree,
-																 bool
-																 outerMostQueryHasLimit);
 static DeferredErrorMessage * DeferErrorIfUnsupportedUnionQuery(Query *queryTree,
 																bool
 																outerMostQueryHasLimit);
@@ -113,7 +111,6 @@ static bool RangeTableListContainsOnlyReferenceTables(List *rangeTableList);
 static FieldSelect * CompositeFieldRecursive(Expr *expression, Query *query);
 static bool FullCompositeFieldList(List *compositeFieldList);
 static MultiNode * MultiNodeTree(Query *queryTree);
-static void ErrorIfQueryNotSupported(Query *queryTree);
 static DeferredErrorMessage * DeferredErrorIfUnsupportedRecurringTuplesJoin(
 	PlannerRestrictionContext *plannerRestrictionContext);
 static bool ShouldRecurseForRecurringTuplesJoinChecks(RelOptInfo *relOptInfo);
@@ -393,12 +390,17 @@ SubqueryMultiNodeTree(Query *originalQuery, Query *queryTree,
 {
 	MultiNode *multiQueryNode = NULL;
 	DeferredErrorMessage *subqueryPushdownError = NULL;
+	DeferredErrorMessage *unsupportedQueryError = NULL;
 
 	/*
 	 * This is a generic error check that applies to both subquery pushdown
 	 * and single table repartition subquery.
 	 */
-	ErrorIfQueryNotSupported(originalQuery);
+	unsupportedQueryError = DeferErrorIfQueryNotSupported(originalQuery);
+	if (unsupportedQueryError != NULL)
+	{
+		RaiseDeferredError(unsupportedQueryError, ERROR);
+	}
 
 	/*
 	 * In principle, we're first trying subquery pushdown planner. If it fails
@@ -895,7 +897,7 @@ DeferErrorIfUnsupportedSublinkAndReferenceTable(Query *queryTree)
  * limit, we let this query to run, but results could be wrong depending on the
  * features of underlying tables.
  */
-static DeferredErrorMessage *
+DeferredErrorMessage *
 DeferErrorIfCannotPushdownSubquery(Query *subqueryTree, bool outerMostQueryHasLimit)
 {
 	bool preconditionsSatisfied = true;
@@ -1718,9 +1720,14 @@ MultiNodeTree(Query *queryTree)
 	MultiProject *projectNode = NULL;
 	MultiExtendedOp *extendedOpNode = NULL;
 	MultiNode *currentTopNode = NULL;
+	DeferredErrorMessage *unsupportedQueryError = NULL;
 
 	/* verify we can perform distributed planning on this query */
-	ErrorIfQueryNotSupported(queryTree);
+	unsupportedQueryError = DeferErrorIfQueryNotSupported(queryTree);
+	if (unsupportedQueryError != NULL)
+	{
+		RaiseDeferredError(unsupportedQueryError, ERROR);
+	}
 
 	/* extract where clause qualifiers and verify we can plan for them */
 	whereClauseList = WhereClauseList(queryTree->jointree);
@@ -2150,12 +2157,12 @@ IsReadIntermediateResultFunction(Node *node)
 
 
 /*
- * ErrorIfQueryNotSupported checks that we can perform distributed planning for
+ * DeferErrorIfQueryNotSupported checks that we can perform distributed planning for
  * the given query. The checks in this function will be removed as we support
  * more functionality in our distributed planning.
  */
-static void
-ErrorIfQueryNotSupported(Query *queryTree)
+DeferredErrorMessage *
+DeferErrorIfQueryNotSupported(Query *queryTree)
 {
 	char *errorMessage = NULL;
 	bool hasTablesample = false;
@@ -2263,10 +2270,13 @@ ErrorIfQueryNotSupported(Query *queryTree)
 	if (!preconditionsSatisfied)
 	{
 		bool showHint = ErrorHintRequired(errorHint, queryTree);
-		ereport(ERROR, (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-						errmsg("%s", errorMessage),
-						showHint ? errhint("%s", errorHint) : 0));
+
+		return DeferredError(ERRCODE_FEATURE_NOT_SUPPORTED,
+							 errorMessage, NULL,
+							 showHint ? errorHint : NULL);
 	}
+
+	return NULL;
 }
 
 
@@ -3781,9 +3791,14 @@ SubqueryPushdownMultiNodeTree(Query *queryTree)
 	Query *pushedDownQuery = NULL;
 	List *subqueryTargetEntryList = NIL;
 	List *havingClauseColumnList = NIL;
+	DeferredErrorMessage *unsupportedQueryError = NULL;
 
 	/* verify we can perform distributed planning on this query */
-	ErrorIfQueryNotSupported(queryTree);
+	unsupportedQueryError = DeferErrorIfQueryNotSupported(queryTree);
+	if (unsupportedQueryError != NULL)
+	{
+		RaiseDeferredError(unsupportedQueryError, ERROR);
+	}
 
 	/*
 	 * We would be creating a new Query and pushing down top level query's

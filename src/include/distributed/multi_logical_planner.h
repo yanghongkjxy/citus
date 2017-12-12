@@ -186,6 +186,9 @@ extern bool SubqueryPushdown;
 extern MultiTreeRoot * MultiLogicalPlanCreate(Query *originalQuery, Query *queryTree,
 											  PlannerRestrictionContext *
 											  plannerRestrictionContext);
+extern DeferredErrorMessage * DeferErrorIfCannotPushdownSubquery(Query *subqueryTree,
+																 bool
+																 outerMostQueryHasLimit);
 extern PlannerRestrictionContext * FilterPlannerRestrictionForQuery(
 	PlannerRestrictionContext *plannerRestrictionContext,
 	Query *query);
@@ -205,6 +208,7 @@ extern List * FindNodesOfType(MultiNode *node, int type);
 extern List * JoinClauseList(List *whereClauseList);
 extern bool IsJoinClause(Node *clause);
 extern List * SubqueryEntryList(Query *queryTree);
+extern DeferredErrorMessage * DeferErrorIfQueryNotSupported(Query *queryTree);
 extern bool ExtractRangeTableIndexWalker(Node *node, List **rangeTableIndexList);
 extern List * WhereClauseList(FromExpr *fromExpr);
 extern List * QualifierList(FromExpr *fromExpr);
