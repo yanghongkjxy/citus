@@ -961,7 +961,7 @@ DeferErrorIfCannotPushdownSubquery(Query *subqueryTree, bool outerMostQueryHasLi
 
 	if (subqueryTree->cteList)
 	{
-		preconditionsSatisfied = true;
+		preconditionsSatisfied = false;
 		errorDetail = "Common Table Expressions are currently unsupported";
 	}
 
