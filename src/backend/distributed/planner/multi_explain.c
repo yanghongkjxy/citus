@@ -34,6 +34,7 @@
 #include "distributed/multi_server_executor.h"
 #include "distributed/remote_commands.h"
 #include "distributed/placement_connection.h"
+#include "distributed/recursive_planning.h"
 #include "distributed/worker_protocol.h"
 #include "lib/stringinfo.h"
 #include "nodes/plannodes.h"
