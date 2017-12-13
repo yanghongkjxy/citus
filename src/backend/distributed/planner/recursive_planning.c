@@ -122,7 +122,7 @@ PlanPullPushSubqueriesWalker(Node *node, RecursivePlanningContext *context);
 static bool ShouldRecursivelyPlanSubquery(Query *query,
 										  RecursivePlanningContext *context);
 static void
-RecursivelyPlanQuery(Query *query, RecursivePlanningContext *context);
+RecursivelyPlanSubquery(Query *query, RecursivePlanningContext *context);
 
 /*
  * RecursivelyPlanSubqueriesAndCTEs finds subqueries and CTEs that cannot be pushed down to
@@ -177,7 +177,9 @@ RecursivelyPlanSubqueriesAndCTEs(Query *query,
 
 
 	*subPlanList = context.subPlanList;
+	elog(INFO, "Plan len1 :%d", list_length(context.subPlanList));
 
+elog(INFO, "Plan len :%d", list_length(*subPlanList));
 	return NULL;
 }
 
@@ -195,12 +197,14 @@ PlanPullPushSubqueriesWalker(Node *node, RecursivePlanningContext *context)
 		Query *query = (Query *) node;
 
 		context->level += 1;
-		RecursivelyPlanSubqueriesAndCTEs(query, context->plannerRestrictionContext, context->planId, &(context->subPlanList));
+		query_tree_walker(query, PlanPullPushSubqueriesWalker, context, 0);
+
 		context->level -= 1;
 
 		if (ShouldRecursivelyPlanSubquery(query, context))
 		{
-			RecursivelyPlanQuery(query, context);
+			RecursivelyPlanSubquery(query, context);
+			elog(INFO, "Context size: %d", list_length(context->subPlanList));
 		}
 
 		return false;
@@ -215,12 +219,12 @@ PlanPullPushSubqueriesWalker(Node *node, RecursivePlanningContext *context)
  * result query and returns the subplan.
  */
 static void
-RecursivelyPlanQuery(Query *query, RecursivePlanningContext *context)
+RecursivelyPlanSubquery(Query *query, RecursivePlanningContext *context)
 {
+	DistributedSubPlan *subPlan = CitusMakeNode(DistributedSubPlan);
+
 	uint64 planId = context->planId;
 	int subPlanId = list_length(context->subPlanList);
-
-	DistributedSubPlan *subPlan = CitusMakeNode(DistributedSubPlan);
 
 	Query *resultQuery = NULL;
 	int cursorOptions = 0;
@@ -239,6 +243,7 @@ RecursivelyPlanQuery(Query *query, RecursivePlanningContext *context)
 			 resultQueryString->data);
 	}
 
+
 	if (ContainsReadIntermediateResultFunction((Node *) query))
 	{
 		cursorOptions |= CURSOR_OPT_FORCE_DISTRIBUTED;
@@ -256,6 +261,8 @@ RecursivelyPlanQuery(Query *query, RecursivePlanningContext *context)
 	context->subPlanList = lappend(context->subPlanList, subPlan);
 
 	memcpy(query, resultQuery, sizeof(Query));
+
+
 }
 
 static bool
