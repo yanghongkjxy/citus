@@ -1,0 +1,55 @@
+# Notes:
+#   - Minimal appveyor.yml file is an empty file. All sections are optional.
+#   - Indent each level of configuration with 2 spaces. Do not use tabs!
+#   - All section names are case-sensitive.
+#   - Section names should be unique on each level.
+#   - Full sample file at: https://www.appveyor.com/docs/appveyor-yml/
+
+#---------------------------------#
+#      general configuration      #
+#---------------------------------#
+
+version: 1.0.{build}-{branch}
+
+# Maximum number of concurrent jobs for the project
+max_jobs: 1
+
+#---------------------------------#
+#    environment configuration    #
+#---------------------------------#
+
+# Build worker image (VM template)
+image: Visual Studio 2017
+
+# scripts that are called at very beginning, before repo cloning
+init:
+  - git config --global core.autocrlf input
+
+# clone directory
+clone_folder: c:\projects\citus
+
+# doesn't checkout the entire history, uses github API to download a zip of the repo
+shallow_clone: true                 # default is "false"
+
+# scripts which run after cloning repository
+install:
+  - git clone -b win_support_pg10 https://github.com/citusdata/postgres-windows C:\projects\postgres
+  - move C:\projects\citus C:\projects\postgres\contrib\citus
+
+#---------------------------------#
+#       build configuration       #
+#---------------------------------#
+
+platform: x64
+configuration:
+  - Release
+
+build_script:
+  - C:\projects\postgres\src\tools\msvc\build RELEASE
+
+#---------------------------------#
+#       tests configuration       #
+#---------------------------------#
+
+# disable automatic tests
+test: off
