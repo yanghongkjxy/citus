@@ -136,6 +136,12 @@ static Query * BuildSubPlanResultQuery(Query *subquery, List *columnAliasList,
 									   uint64 planId, uint32 subPlanId);
 
 
+static bool
+RecursivelyPlanRemaningSubqueries(Query *query, RecursivePlanningContext *context);
+static bool
+ShouldRecursivelyPlanSublinks(Query *query, RecursivePlanningContext *context);
+static bool
+RecursivelyPlanAllSubqueries(Node *node, RecursivePlanningContext *planningContext);
 /*
  * GenerateSubplansForSubqueriesAndCTEs is a wrapper around RecursivelyPlanSubqueriesAndCTEs.
  * The function returns the subplans if necessary. For the details of when/how subplans are
@@ -238,8 +244,120 @@ RecursivelyPlanSubqueriesAndCTEs(Query *query, RecursivePlanningContext *context
 		RecursivelyPlanSetOperations(query, (Node *) query->setOperations, context);
 	}
 
+	/*
+	 * We're ...
+	 *
+	 */
+	if (ShouldRecursivelyPlanSublinks(query, context))
+	{
+		elog(INFO, "we've replaced with this change");
+		RecursivelyPlanAllSubqueries(query->jointree->quals, context);
+	}
+
 	return NULL;
 }
+
+
+static bool
+ShouldRecursivelyPlanSublinks(Query *query, RecursivePlanningContext *context)
+{
+	PlannerRestrictionContext *filteredRestrictionContext = NULL;
+	List *sublinkList = SublinkList(query);
+	ListCell *subLinkCell = NULL;
+	Relids allSublinkRteIdentities = NULL;
+
+	if (list_length(sublinkList) < 1)
+	{
+		return false;
+	}
+
+	/*
+	 * FROM ref WHERE (subquery)
+	 */
+	if (!FindNodeCheckInRangeTableList(query->rtable, IsDistributedTableRTE))
+	{
+		return true;
+	}
+
+	/*
+	 * Safe to pushdown the subquery at all, thus skip recursive planning.
+	 */
+	filteredRestrictionContext =
+			FilterPlannerRestrictionForQuery(context->plannerRestrictionContext, query);
+	if (RestrictionEquivalenceForPartitionKeys(filteredRestrictionContext))
+	{
+		return false;
+	}
+
+	foreach(subLinkCell, sublinkList)
+	{
+		SubLink *sublink = (SubLink *) lfirst(subLinkCell);
+		Node *subselect = sublink->subselect;
+		Query *subquery = NULL;
+		Relids subqueryRteIdentities = NULL;
+
+		if (!IsA(subselect, Query))
+		{
+			continue;
+		}
+
+		subquery = (Query *) subselect;
+
+		subqueryRteIdentities = QueryRteIdentities(query);
+
+		allSublinkRteIdentities = bms_union(allSublinkRteIdentities, subqueryRteIdentities);
+	}
+
+	if (bms_num_members(allSublinkRteIdentities) < 1)
+	{
+		return false;
+	}
+
+	/*
+	 * The logic here is that, we get the RTEIdentities of all the relations on all the sublinks.
+	 * Later, we remove those RTEIdentities from the restriction context of the whole subquery. By doing that,
+	 * we're able to check whether the FROM subqueries are safe to pushdown independent of the sublinks.
+	 * If that's the case, we decide to recursively plan all sublinks.
+	 */
+	filteredRestrictionContext->relationRestrictionContext =
+		RemoveRelationRestrictionContext(filteredRestrictionContext->relationRestrictionContext,
+			allSublinkRteIdentities);
+	if (RestrictionEquivalenceForPartitionKeys(filteredRestrictionContext))
+	{
+		return true;
+	}
+
+	return false;
+}
+
+/*
+ * RecursivelyPlanAllSubqueries descends into an expression tree and recursively
+ * plans all subqueries found from the top.
+ */
+static bool
+RecursivelyPlanAllSubqueries(Node *node, RecursivePlanningContext *planningContext)
+{
+	if (node == NULL)
+	{
+		return false;
+	}
+
+	if (IsA(node, Query))
+ 	{
+ 		Query *query = (Query *) node;
+
+ 		if (FindNodeCheckInRangeTableList(query->rtable, IsDistributedTableRTE))
+ 		{
+ 			RecursivelyPlanSubquery(query, planningContext);
+ 		}
+
+ 		return false;
+ 	}
+
+ 	return expression_tree_walker(node, RecursivelyPlanAllSubqueries, planningContext);
+ }
+
+
 
 
 /*

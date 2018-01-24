@@ -85,23 +85,17 @@ static DeferredErrorMessage * DeferErrorIfUnsupportedSubqueryPushdown(Query *
 																	  PlannerRestrictionContext
 																	  *
 																	  plannerRestrictionContext);
-static RelationRestrictionContext * FilterRelationRestrictionContext(
-	RelationRestrictionContext *relationRestrictionContext,
-	Relids
-	queryRteIdentities);
 static JoinRestrictionContext * FilterJoinRestrictionContext(
 	JoinRestrictionContext *joinRestrictionContext, Relids
 	queryRteIdentities);
 static bool RangeTableArrayContainsAnyRTEIdentities(RangeTblEntry **rangeTableEntries, int
 													rangeTableArrayLength, Relids
 													queryRteIdentities);
-static Relids QueryRteIdentities(Query *queryTree);
 static DeferredErrorMessage * DeferErrorIfFromClauseRecurs(Query *queryTree);
 static bool ExtractSetOperationStatmentWalker(Node *node, List **setOperationList);
 static DeferredErrorMessage * DeferErrorIfUnsupportedTableCombination(Query *queryTree);
 static bool WindowPartitionOnDistributionColumn(Query *query);
 static bool AllTargetExpressionsAreColumnReferences(List *targetEntryList);
-static bool IsDistributedTableRTE(Node *node);
 static FieldSelect * CompositeFieldRecursive(Expr *expression, Query *query);
 static bool FullCompositeFieldList(List *compositeFieldList);
 static MultiNode * MultiNodeTree(Query *queryTree);
@@ -170,7 +164,6 @@ static MultiNode * SubqueryMultiNodeTree(Query *originalQuery,
 										 Query *queryTree,
 										 PlannerRestrictionContext *
 										 plannerRestrictionContext);
-static List * SublinkList(Query *originalQuery);
 static bool ExtractSublinkWalker(Node *node, List **sublinkList);
 static MultiNode * SubqueryPushdownMultiNodeTree(Query *queryTree);
 
@@ -328,7 +321,7 @@ FindNodeCheck(Node *node, bool (*check)(Node *))
  * that the function should be called on the original query given that postgres
  * standard_planner() may convert the subqueries in WHERE clause to joins.
  */
-static List *
+List *
 SublinkList(Query *originalQuery)
 {
 	FromExpr *joinTree = originalQuery->jointree;
@@ -674,7 +667,7 @@ FilterPlannerRestrictionForQuery(PlannerRestrictionContext *plannerRestrictionCo
  * in the queryRteIdentities and returns a newly allocated
  * RelationRestrictionContext.
  */
-static RelationRestrictionContext *
+RelationRestrictionContext *
 FilterRelationRestrictionContext(RelationRestrictionContext *relationRestrictionContext,
 								 Relids queryRteIdentities)
 {
@@ -696,6 +689,35 @@ FilterRelationRestrictionContext(RelationRestrictionContext *relationRestriction
 				lappend(filteredRestrictionContext->relationRestrictionList,
 						relationRestriction);
 		}
+	}
+
+	return filteredRestrictionContext;
+}
+
+RelationRestrictionContext *
+RemoveRelationRestrictionContext(RelationRestrictionContext *relationRestrictionContext,
+								 Relids queryRteIdentities)
+{
+	RelationRestrictionContext *filteredRestrictionContext =
+		palloc0(sizeof(RelationRestrictionContext));
+
+	ListCell *relationRestrictionCell = NULL;
+
+	foreach(relationRestrictionCell, relationRestrictionContext->relationRestrictionList)
+	{
+		RelationRestriction *relationRestriction =
+			(RelationRestriction *) lfirst(relationRestrictionCell);
+
+		int rteIdentity = GetRTEIdentity(relationRestriction->rte);
+
+		if (bms_is_member(rteIdentity, queryRteIdentities))
+		{
+			continue;
+		}
+
+		filteredRestrictionContext->relationRestrictionList =
+			lappend(filteredRestrictionContext->relationRestrictionList,
+					relationRestriction);
 	}
 
 	return filteredRestrictionContext;
@@ -790,7 +812,7 @@ RangeTableArrayContainsAnyRTEIdentities(RangeTblEntry **rangeTableEntries, int
  * QueryRteIdentities gets a queryTree, find get all the rte identities assigned by
  * us.
  */
-static Relids
+Relids
 QueryRteIdentities(Query *queryTree)
 {
 	List *rangeTableList = NULL;
@@ -1545,7 +1567,7 @@ QueryContainsDistributedTableRTE(Query *query)
  * is a range table relation entry that points to a distributed
  * relation (i.e., excluding reference tables).
  */
-static bool
+bool
 IsDistributedTableRTE(Node *node)
 {
 	RangeTblEntry *rangeTableEntry = NULL;
