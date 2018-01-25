@@ -1244,7 +1244,8 @@ LocalJoin(JoinOrderNode *currentJoinNode, TableEntry *candidateTable,
 	}
 
 	/* shard interval lists must have 1-1 matching for local joins */
-	coPartitionedTables = CoPartitionedTables(currentJoinNode->propagatedTable->relationId, candidateTable->relationId);
+	coPartitionedTables = CoPartitionedTables(
+		currentJoinNode->propagatedTable->relationId, candidateTable->relationId);
 
 	if (!coPartitionedTables)
 	{
@@ -1252,9 +1253,9 @@ LocalJoin(JoinOrderNode *currentJoinNode, TableEntry *candidateTable,
 	}
 
 	nextJoinNode = MakeJoinOrderNode(candidateTable, LOCAL_PARTITION_JOIN,
-										 currentPartitionColumn,
-										 currentPartitionMethod,
-										 currentPropagatedTable);
+									 currentPartitionColumn,
+									 currentPartitionMethod,
+									 currentPropagatedTable);
 
 
 	return nextJoinNode;
@@ -1402,8 +1403,7 @@ DualPartitionJoin(JoinOrderNode *currentJoinNode, TableEntry *candidateTable,
 		{
 			nextPropagateTable = currentJoinNode->propagatedTable;
 		}
-
-		else if(equal(nextPartitionColumn, candidatePartitionColumn))
+		else if (equal(nextPartitionColumn, candidatePartitionColumn))
 		{
 			nextPropagateTable = candidateTable;
 		}
