@@ -653,6 +653,7 @@ DeferErrorIfFromClauseRecurs(Query *queryTree)
 	{
 		return DeferredError(ERRCODE_FEATURE_NOT_SUPPORTED,
 							 "cannot pushdown the subquery",
+
 							 "Reference tables are not allowed in FROM "
 							 "clause when the query has subqueries in "
 							 "WHERE clause and it references a column "

@@ -88,6 +88,8 @@ typedef struct RecursivePlanningContext
 	uint64 planId;
 	List *subPlanList;
 	PlannerRestrictionContext *plannerRestrictionContext;
+
+	int rteIdentity;
 } RecursivePlanningContext;
 
 
@@ -139,6 +141,16 @@ static Query * BuildSubPlanResultQuery(Query *subquery, List *columnAliasList,
 									   uint64 planId, uint32 subPlanId);
 
 
+static bool
+ShouldRecursivelyPlanNonColocatedJoins(Query *query, RecursivePlanningContext *context);
+static void
+RecursivelyPlanNonColocatedJoins(Query *query, RecursivePlanningContext *context);
+static RelationRestrictionContext *
+RemoveRTEIdentitiesFromRelationRestrictionContext(RelationRestrictionContext *relationRestrictionContext,
+								 Relids queryRteIdentities);
+static Relids
+SublinkRelids(Query *query);
+
 /*
  * GenerateSubplansForSubqueriesAndCTEs is a wrapper around RecursivelyPlanSubqueriesAndCTEs.
  * The function returns the subplans if necessary. For the details of when/how subplans are
@@ -161,6 +173,7 @@ GenerateSubplansForSubqueriesAndCTEs(uint64 planId, Query *originalQuery,
 	context.planId = planId;
 	context.subPlanList = NIL;
 	context.plannerRestrictionContext = plannerRestrictionContext;
+	context.rteIdentity = 0;
 
 	error = RecursivelyPlanSubqueriesAndCTEs(originalQuery, &context);
 	if (error != NULL)
@@ -250,7 +263,230 @@ RecursivelyPlanSubqueriesAndCTEs(Query *query, RecursivePlanningContext *context
 		RecursivelyPlanAllSubqueries(query->jointree->quals, context);
 	}
 
+	if (ShouldRecursivelyPlanNonColocatedJoins(query, context))
+	{
+		RecursivelyPlanNonColocatedJoins(query, context);
+	}
+
 	return NULL;
+}
+
+
+static bool
+ShouldRecursivelyPlanNonColocatedJoins(Query *query, RecursivePlanningContext *context)
+{
+	PlannerRestrictionContext *filteredRestrictionContext = NULL;
+
+	if (FindNodeCheckInRangeTableList(query->rtable, IsLocalTableRTE))
+	{
+		return false;
+	}
+
+	filteredRestrictionContext =
+			FilterPlannerRestrictionForQuery(context->plannerRestrictionContext, query);
+	if (!RestrictionEquivalenceForPartitionKeys(filteredRestrictionContext))
+	{
+		return true;
+	}
+
+	return false;
+}
+
+typedef struct OnderContext
+{
+	int rteId;
+	Query *query;
+} OnderContext;
+
+static bool ExtractQueryWalkerWithId(Node *node, OnderContext *context);
+
+static void
+RecursivelyPlanNonColocatedJoins(Query *query, RecursivePlanningContext *context)
+{
+	Relids sublinkRelids = SublinkRelids(query);
+
+	PlannerRestrictionContext *filteredRestrictionContext =
+		FilterPlannerRestrictionForQuery(context->plannerRestrictionContext, query);
+	RelationRestrictionContext *filteredRelationRestrictionContext =
+		filteredRestrictionContext->relationRestrictionContext;
+
+	List *attributeEquivalenceList =
+		AttributeEquivaenceList(filteredRestrictionContext);
+
+	RelationRestrictionContext *fromClauseRelationRestrictionContext = NULL;
+
+	fromClauseRelationRestrictionContext =
+			RemoveRTEIdentitiesFromRelationRestrictionContext(filteredRelationRestrictionContext,
+															  sublinkRelids);
+
+	if (!EquivalenceListContainsRelationsEquality(attributeEquivalenceList,
+												  fromClauseRelationRestrictionContext))
+	{
+		/*
+		 * TODO: Implement recursive planning on non-colocated joins in the FROM clause. Note that
+		 * we should also consider OUTER JOINs that are non-colocated.
+		 */
+		return;
+	}
+
+	/*
+	 * At this point we're sure that FROM clause entries are safe to pushdown but not the
+	 * whole query. Thus, we should recursively plan some (or all) subqueries in WHERE clause
+	 * to be able to execute the whole query.
+	 */
+
+	/*
+	 * First check whether we'd want to recursively plan all subqueries in WHERE clause.
+	 * This could happen if all FROM subqueries are replaced above.
+	 */
+	if (ShouldRecursivelyPlanAllSublinks(query))
+	{
+		RecursivelyPlanAllSubqueries(query->jointree->quals, context);
+	}
+	else
+	{
+		int sublinkRTEIdentity = -1;
+		List *allAttributeEquivalenceList = NIL;
+
+		/*
+		 * Get the filtered context again since it might have changed in case
+		 * FROM subqueries are recursively planned.
+		 */
+		filteredRestrictionContext =
+				FilterPlannerRestrictionForQuery(context->plannerRestrictionContext,
+												 query);
+
+		/* calculate the attribute equivalances with the updated restriction context */
+		allAttributeEquivalenceList =
+			AttributeEquivaenceList(filteredRestrictionContext);
+
+		/*
+		 * Iterate on each of the RTE_RELATION in the sublinks. When a non-equi join
+		 * among the Ffound, recursively plan
+		 */
+		while ((sublinkRTEIdentity =
+				bms_next_member(sublinkRelids, sublinkRTEIdentity)) >= 0)
+		{
+			RelationRestrictionContext *relationRestriction =
+			FilterRelationRestrictionContext(filteredRelationRestrictionContext,
+											 bms_make_singleton(sublinkRTEIdentity));
+
+			fromClauseRelationRestrictionContext =
+					RemoveRTEIdentitiesFromRelationRestrictionContext(filteredRestrictionContext->relationRestrictionContext,
+																	  sublinkRelids);
+
+
+
+			fromClauseRelationRestrictionContext->relationRestrictionList =
+					lappend(fromClauseRelationRestrictionContext->relationRestrictionList, linitial(relationRestriction->relationRestrictionList));
+
+			if (!EquivalenceListContainsRelationsEquality(allAttributeEquivalenceList,
+					fromClauseRelationRestrictionContext))
+			{
+				context->rteIdentity = sublinkRTEIdentity;
+
+				OnderContext context2;
+
+				context2.rteId = sublinkRTEIdentity;
+
+				ExtractQueryWalkerWithId(query->jointree->quals, &context2);
+
+				if (context2.query != NULL)
+				RecursivelyPlanSubquery(context2.query, context);
+			}
+
+		}
+	}
+
+}
+
+
+
+
+static bool
+ExtractQueryWalkerWithId(Node *node, OnderContext *context)
+{
+	if (node == NULL)
+	{
+		return false;
+	}
+
+	if (IsA(node, Query))
+	{
+		Query *query = (Query *) node;
+
+		Relids queryRTES = QueryRteIdentities(query);
+
+		if (bms_is_member(context->rteId, queryRTES))
+		{
+
+			context->query = query;
+
+			return false;
+		}
+
+		return query_tree_walker(query, ExtractQueryWalkerWithId, context, 0);
+	}
+
+	return expression_tree_walker(node, ExtractQueryWalkerWithId, context);
+}
+
+
+static RelationRestrictionContext *
+RemoveRTEIdentitiesFromRelationRestrictionContext(RelationRestrictionContext *relationRestrictionContext,
+								 Relids queryRteIdentities)
+{
+		RelationRestrictionContext *filteredRestrictionContext =
+		palloc0(sizeof(RelationRestrictionContext));
+
+	ListCell *relationRestrictionCell = NULL;
+
+	foreach(relationRestrictionCell, relationRestrictionContext->relationRestrictionList)
+	{
+		RelationRestriction *relationRestriction =
+			(RelationRestriction *) lfirst(relationRestrictionCell);
+
+		int rteIdentity = GetRTEIdentity(relationRestriction->rte);
+
+		if (bms_is_member(rteIdentity, queryRteIdentities))
+		{
+			continue;
+		}
+
+		filteredRestrictionContext->relationRestrictionList =
+			lappend(filteredRestrictionContext->relationRestrictionList,
+					relationRestriction);
+	}
+
+	return filteredRestrictionContext;
+}
+
+static Relids
+SublinkRelids(Query *query)
+{
+	List *sublinkList = SublinkList(query);
+	Relids allSublinkRteIdentities = NULL;
+	ListCell *subLinkCell = NULL;
+		foreach(subLinkCell, sublinkList)
+		{
+			SubLink *sublink = (SubLink *) lfirst(subLinkCell);
+			Node *subselect = sublink->subselect;
+			Query *subquery = NULL;
+			Relids subqueryRteIdentities = NULL;
+
+			if (!IsA(subselect, Query))
+			{
+				continue;
+			}
+
+			subquery = (Query *) subselect;
+
+			subqueryRteIdentities = QueryRteIdentities(subquery);
+
+			allSublinkRteIdentities = bms_union(allSublinkRteIdentities, subqueryRteIdentities);
+		}
+
+		return allSublinkRteIdentities;
 }
 
 
@@ -702,6 +938,22 @@ RecursivelyPlanSubquery(Query *subquery, RecursivePlanningContext *planningConte
 					 "contains references to outer queries");
 
 		return;
+	}
+
+	if (planningContext->rteIdentity != 0)
+	{
+		Relids relids = QueryRteIdentities(subquery);
+		if (!bms_is_member(planningContext->rteIdentity, relids))
+		{
+			elog(DEBUG2, "skipping recursive planning for the subquery since it "
+						 "doesn't contain the input RTE");
+
+			return;
+		}
+		else
+		{
+			elog(DEBUG2, "I'm about to replace subquery with rte");
+		}
 	}
 
 	/*
