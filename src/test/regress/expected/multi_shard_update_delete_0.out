@@ -185,7 +185,7 @@ SELECT master_create_empty_shard('test_append_table');
 SELECT * FROM master_append_table_to_shard(1440010, 'append_stage_table', 'localhost', :master_port);
  master_append_table_to_shard 
 ------------------------------
-                    0.0266667
+                   0.00533333
 (1 row)
 
 SELECT master_create_empty_shard('test_append_table') AS new_shard_id;
@@ -197,7 +197,7 @@ SELECT master_create_empty_shard('test_append_table') AS new_shard_id;
 SELECT * FROM master_append_table_to_shard(1440011, 'append_stage_table', 'localhost', :master_port);
  master_append_table_to_shard 
 ------------------------------
-                    0.0266667
+                   0.00533333
 (1 row)
 
 UPDATE test_append_table SET col_2 = 5;
@@ -346,20 +346,20 @@ UPDATE users_test_table SET value_2 = 5 FROM events_test_table WHERE users_test_
 ERROR:  cannot perform distributed planning for the given modification
 DETAIL:  Joins are not supported in distributed modifications.
 UPDATE users_test_table SET value_2 = (SELECT value_3 FROM users_test_table);
-ERROR:  subqueries are not supported in modifications across multiple shards
-DETAIL:  Consider using an equality filter on partition column "user_id" to target a single shard.
+ERROR:  cannot perform distributed planning for the given modification
+DETAIL:  Joins are not supported in distributed modifications.
 UPDATE users_test_table SET value_2 = (SELECT value_2 FROM events_test_table);
-ERROR:  subqueries are not supported in modifications across multiple shards
-DETAIL:  Consider using an equality filter on partition column "user_id" to target a single shard.
+ERROR:  cannot perform distributed planning for the given modification
+DETAIL:  Joins are not supported in distributed modifications.
 DELETE FROM users_test_table USING events_test_table WHERE users_test_table.user_id = events_test_table.user_id;
 ERROR:  cannot perform distributed planning for the given modification
 DETAIL:  Joins are not supported in distributed modifications.
 DELETE FROM users_test_table WHERE users_test_table.user_id = (SELECT user_id FROM events_test_table);
-ERROR:  subqueries are not supported in modifications across multiple shards
-DETAIL:  Consider using an equality filter on partition column "user_id" to target a single shard.
+ERROR:  cannot perform distributed planning for the given modification
+DETAIL:  Joins are not supported in distributed modifications.
 DELETE FROM users_test_table WHERE users_test_table.user_id = (SELECT value_1 FROM users_test_table);
-ERROR:  subqueries are not supported in modifications across multiple shards
-DETAIL:  Consider using an equality filter on partition column "user_id" to target a single shard.
+ERROR:  cannot perform distributed planning for the given modification
+DETAIL:  Joins are not supported in distributed modifications.
 -- Cursors are not supported
 BEGIN;
 DECLARE test_cursor CURSOR FOR SELECT * FROM users_test_table;

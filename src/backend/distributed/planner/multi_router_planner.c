@@ -110,6 +110,7 @@ static DistributedPlan * CreateSingleTaskRouterPlan(Query *originalQuery,
 													Query *query,
 													RelationRestrictionContext *
 													restrictionContext);
+static bool IsTidColumn(Node *node);
 static bool MasterIrreducibleExpression(Node *expression, bool *varArgument,
 										bool *badCoalesce);
 static bool MasterIrreducibleExpressionWalker(Node *expression, WalkerState *state);
@@ -126,10 +127,6 @@ static Job * RouterJob(Query *originalQuery,
 					   RelationRestrictionContext *restrictionContext,
 					   DeferredErrorMessage **planningError);
 static bool RelationPrunesToMultipleShards(List *relationShardList);
-static List * TargetShardIntervalsForRouter(Query *query,
-											RelationRestrictionContext *restrictionContext,
-											bool *multiShardQuery);
-static List * WorkersContainingAllShards(List *prunedShardIntervalsList);
 static void NormalizeMultiRowInsertTargetList(Query *query);
 static List * BuildRoutesForInsert(Query *query, DeferredErrorMessage **planningError);
 static List * GroupInsertValuesByShardId(List *insertValuesList);
@@ -191,7 +188,8 @@ CreateModifyPlan(Query *originalQuery, Query *query,
 
 	distributedPlan->operation = query->commandType;
 
-	distributedPlan->planningError = ModifyQuerySupported(query, multiShardQuery);
+	distributedPlan->planningError = ModifyQuerySupported(query, originalQuery,
+														  multiShardQuery);
 	if (distributedPlan->planningError != NULL)
 	{
 		return distributedPlan;
@@ -489,11 +487,36 @@ ExtractInsertRangeTableEntry(Query *query)
 
 
 /*
+ * IsTidColumn gets a node and returns true if the node is a Var type of TID.
+ */
+static bool
+IsTidColumn(Node *node)
+{
+	if (IsA(node, Var))
+	{
+		Var *column = (Var *) node;
+		if (column->vartype == TIDOID)
+		{
+			return true;
+		}
+	}
+
+	return false;
+}
+
+
+/*
  * ModifyQuerySupported returns NULL if the query only contains supported
  * features, otherwise it returns an error description.
+ * Note that we need both the original query and the modified one because
+ * different checks need different versions. In particular, we cannot
+ * perform the ContainsReadIntermediateResultFunction check on the
+ * rewritten query because it may have been replaced by a subplan,
+ * while some of the checks for setting the partition column value rely
+ * on the rewritten query.
  */
 DeferredErrorMessage *
-ModifyQuerySupported(Query *queryTree, bool multiShardQuery)
+ModifyQuerySupported(Query *queryTree, Query *originalQuery, bool multiShardQuery)
 {
 	Oid distributedTableId = ExtractFirstDistributedTableId(queryTree);
 	uint32 rangeTableId = 1;
@@ -507,8 +530,27 @@ ModifyQuerySupported(Query *queryTree, bool multiShardQuery)
 	List *onConflictSet = NIL;
 	Node *arbiterWhere = NULL;
 	Node *onConflictWhere = NULL;
-
 	CmdType commandType = queryTree->commandType;
+
+	/*
+	 * Here, we check if a recursively planned query tries to modify
+	 * rows based on the ctid column. This is a bad idea because ctid of
+	 * the rows could be changed before the modification part of
+	 * the query is executed.
+	 */
+	if (ContainsReadIntermediateResultFunction((Node *) originalQuery))
+	{
+		bool hasTidColumn = FindNodeCheck((Node *) originalQuery->jointree, IsTidColumn);
+		if (hasTidColumn)
+		{
+			return DeferredError(ERRCODE_FEATURE_NOT_SUPPORTED,
+								 "cannot perform distributed planning for the given "
+								 "modification",
+								 "Recursively planned distributed modifications "
+								 "with ctid on where clause are not supported.",
+								 NULL);
+		}
+	}
 
 	/*
 	 * Reject subqueries which are in SELECT or WHERE clause.
@@ -516,27 +558,15 @@ ModifyQuerySupported(Query *queryTree, bool multiShardQuery)
 	 */
 	if (queryTree->hasSubLinks == true)
 	{
-		/*
-		 * We support UPDATE and DELETE with subqueries unless they are multi
-		 * shard queries.
-		 */
-		if (!UpdateOrDeleteQuery(queryTree) || multiShardQuery)
+		/* we support subqueries for INSERTs only via INSERT INTO ... SELECT */
+		if (!UpdateOrDeleteQuery(queryTree))
 		{
-			StringInfo errorHint = makeStringInfo();
-			DistTableCacheEntry *cacheEntry = DistributedTableCacheEntry(
-				distributedTableId);
-			char *partitionKeyString = cacheEntry->partitionKeyString;
-			char *partitionColumnName = ColumnNameToColumn(distributedTableId,
-														   partitionKeyString);
-
-			appendStringInfo(errorHint,
-							 "Consider using an equality filter on partition column \"%s\" to target a single shard.",
-							 partitionColumnName);
+			Assert(queryTree->commandType == CMD_INSERT);
 
 			return DeferredError(ERRCODE_FEATURE_NOT_SUPPORTED,
-								 "subqueries are not supported in modifications across "
-								 "multiple shards",
-								 errorHint->data, NULL);
+								 "subqueries are not supported within INSERT queries",
+								 NULL, "Try rewriting your queries with 'INSERT "
+									   "INTO ... SELECT' syntax.");
 		}
 	}
 
@@ -604,7 +634,7 @@ ModifyQuerySupported(Query *queryTree, bool multiShardQuery)
 			 * We support UPDATE and DELETE with subqueries and joins unless
 			 * they are multi shard queries.
 			 */
-			if (UpdateOrDeleteQuery(queryTree) && !multiShardQuery)
+			if (UpdateOrDeleteQuery(queryTree))
 			{
 				continue;
 			}
@@ -707,7 +737,7 @@ ModifyQuerySupported(Query *queryTree, bool multiShardQuery)
 			}
 
 			if (commandType == CMD_UPDATE &&
-				contain_volatile_functions((Node *) targetEntry->expr))
+				FindNodeCheck((Node *) targetEntry->expr, CitusIsVolatileFunction))
 			{
 				return DeferredError(ERRCODE_FEATURE_NOT_SUPPORTED,
 									 "functions used in UPDATE queries on distributed "
@@ -732,7 +762,7 @@ ModifyQuerySupported(Query *queryTree, bool multiShardQuery)
 
 		if (joinTree != NULL)
 		{
-			if (contain_volatile_functions(joinTree->quals))
+			if (FindNodeCheck((Node *) joinTree->quals, CitusIsVolatileFunction))
 			{
 				return DeferredError(ERRCODE_FEATURE_NOT_SUPPORTED,
 									 "functions used in the WHERE clause of modification "
@@ -981,9 +1011,6 @@ MasterIrreducibleExpressionWalker(Node *expression, WalkerState *state)
 	 * Once you've added them to this check, make sure you also evaluate them in the
 	 * executor!
 	 */
-
-	/* subqueries aren't allowed and should fail before control reaches this point */
-	Assert(!IsA(expression, Query));
 
 	hasVolatileFunction =
 		check_functions_in_node(expression, MasterIrreducibleExpressionFunctionChecker,
@@ -1320,7 +1347,6 @@ CreateTask(TaskType taskType)
 	task->upstreamTaskId = INVALID_TASK_ID;
 	task->shardInterval = NULL;
 	task->assignmentConstrained = false;
-	task->shardId = INVALID_SHARD_ID;
 	task->taskExecution = NULL;
 	task->upsertQuery = false;
 	task->replicationModel = REPLICATION_MODEL_INVALID;
@@ -1648,9 +1674,9 @@ PlanRouterQuery(Query *originalQuery, RelationRestrictionContext *restrictionCon
 	bool isMultiShardModifyQuery = false;
 
 	*placementList = NIL;
-	prunedRelationShardList = TargetShardIntervalsForRouter(originalQuery,
-															restrictionContext,
-															&isMultiShardQuery);
+	prunedRelationShardList = TargetShardIntervalsForQuery(originalQuery,
+														   restrictionContext,
+														   &isMultiShardQuery);
 
 	if (isMultiShardQuery)
 	{
@@ -1668,7 +1694,8 @@ PlanRouterQuery(Query *originalQuery, RelationRestrictionContext *restrictionCon
 
 		Assert(UpdateOrDeleteQuery(originalQuery));
 
-		planningError = ModifyQuerySupported(originalQuery, isMultiShardQuery);
+		planningError = ModifyQuerySupported(originalQuery, originalQuery,
+											 isMultiShardQuery);
 		if (planningError != NULL)
 		{
 			return planningError;
@@ -1820,7 +1847,7 @@ GetInitialShardId(List *relationShardList)
 
 
 /*
- * TargetShardIntervalsForRouter performs shard pruning for all referenced relations
+ * TargetShardIntervalsForQuery performs shard pruning for all referenced relations
  * in the query and returns list of shards per relation. Shard pruning is done based
  * on provided restriction context per relation. The function sets multiShardQuery
  * to true if any of the relations pruned down to more than one active shard. It
@@ -1829,10 +1856,10 @@ GetInitialShardId(List *relationShardList)
  * 'and 1=0', such queries are treated as if all of the shards of joining
  * relations are pruned out.
  */
-static List *
-TargetShardIntervalsForRouter(Query *query,
-							  RelationRestrictionContext *restrictionContext,
-							  bool *multiShardQuery)
+List *
+TargetShardIntervalsForQuery(Query *query,
+							 RelationRestrictionContext *restrictionContext,
+							 bool *multiShardQuery)
 {
 	List *prunedRelationShardList = NIL;
 	ListCell *restrictionCell = NULL;
@@ -1918,7 +1945,7 @@ RelationPrunesToMultipleShards(List *relationShardList)
  * exists. The caller should check if there are any shard intervals exist for
  * placement check prior to calling this function.
  */
-static List *
+List *
 WorkersContainingAllShards(List *prunedShardIntervalsList)
 {
 	ListCell *prunedShardIntervalCell = NULL;

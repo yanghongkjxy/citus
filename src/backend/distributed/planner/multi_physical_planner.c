@@ -33,6 +33,7 @@
 #include "distributed/citus_nodes.h"
 #include "distributed/citus_ruleutils.h"
 #include "distributed/colocation_utils.h"
+#include "distributed/deparse_shard_query.h"
 #include "distributed/master_protocol.h"
 #include "distributed/metadata_cache.h"
 #include "distributed/multi_router_planner.h"
@@ -127,11 +128,10 @@ static Job * BuildJobTreeTaskList(Job *jobTree,
 static List * SubquerySqlTaskList(Job *job,
 								  PlannerRestrictionContext *plannerRestrictionContext);
 static void ErrorIfUnsupportedShardDistribution(Query *query);
-static bool CoPartitionedTables(Oid firstRelationId, Oid secondRelationId);
 static bool ShardIntervalsEqual(FmgrInfo *comparisonFunction,
 								ShardInterval *firstInterval,
 								ShardInterval *secondInterval);
-static Task * SubqueryTaskCreate(Query *originalQuery, ShardInterval *shardInterval,
+static Task * SubqueryTaskCreate(Query *originalQuery, int shardIndex,
 								 RelationRestrictionContext *restrictionContext,
 								 uint32 taskId);
 static List * SqlTaskList(Job *job);
@@ -157,8 +157,6 @@ static bool JoinPrunable(RangeTableFragment *leftFragment,
 static ShardInterval * FragmentInterval(RangeTableFragment *fragment);
 static StringInfo FragmentIntervalString(ShardInterval *fragmentInterval);
 static List * DataFetchTaskList(uint64 jobId, uint32 taskIdIndex, List *fragmentList);
-static StringInfo NodeNameArrayString(List *workerNodeList);
-static StringInfo NodePortArrayString(List *workerNodeList);
 static StringInfo DatumArrayString(Datum *datumArray, uint32 datumCount, Oid datumTypeId);
 static List * BuildRelationShardList(List *rangeTableList, List *fragmentList);
 static void UpdateRangeTableAlias(List *rangeTableList, List *fragmentList);
@@ -196,7 +194,8 @@ static StringInfo MergeTableQueryString(uint32 taskIdIndex, List *targetEntryLis
 static StringInfo IntermediateTableQueryString(uint64 jobId, uint32 taskIdIndex,
 											   Query *reduceQuery);
 static uint32 FinalTargetEntryCount(List *targetEntryList);
-
+static bool CoPlacedShardIntervals(ShardInterval *firstInterval,
+								   ShardInterval *secondInterval);
 
 /*
  * CreatePhysicalDistributedPlan is the entry point for physical plan generation. The
@@ -1415,6 +1414,8 @@ BuildSubqueryJobQuery(MultiNode *multiNode)
 	bool hasAggregates = false;
 	List *distinctClause = NIL;
 	bool hasDistinctOn = false;
+	bool hasWindowFuncs = false;
+	List *windowClause = NIL;
 
 	/* we start building jobs from below the collect node */
 	Assert(!CitusIsA(multiNode, MultiCollect));
@@ -1462,6 +1463,8 @@ BuildSubqueryJobQuery(MultiNode *multiNode)
 		havingQual = extendedOp->havingQual;
 		distinctClause = extendedOp->distinctClause;
 		hasDistinctOn = extendedOp->hasDistinctOn;
+		hasWindowFuncs = extendedOp->hasWindowFuncs;
+		windowClause = extendedOp->windowClause;
 	}
 
 	/* build group clauses */
@@ -1508,6 +1511,8 @@ BuildSubqueryJobQuery(MultiNode *multiNode)
 	jobQuery->hasAggs = hasAggregates;
 	jobQuery->hasDistinctOn = hasDistinctOn;
 	jobQuery->distinctClause = distinctClause;
+	jobQuery->hasWindowFuncs = hasWindowFuncs;
+	jobQuery->windowClause = windowClause;
 
 	return jobQuery;
 }
@@ -2051,84 +2056,115 @@ SubquerySqlTaskList(Job *job, PlannerRestrictionContext *plannerRestrictionConte
 	Query *subquery = job->jobQuery;
 	uint64 jobId = job->jobId;
 	List *sqlTaskList = NIL;
-	List *rangeTableList = NIL;
-	ListCell *rangeTableCell = NULL;
+	ListCell *restrictionCell = NULL;
 	uint32 taskIdIndex = 1; /* 0 is reserved for invalid taskId */
-	Oid relationId = 0;
 	int shardCount = 0;
 	int shardOffset = 0;
-	DistTableCacheEntry *targetCacheEntry = NULL;
+	int minShardOffset = 0;
+	int maxShardOffset = 0;
 	RelationRestrictionContext *relationRestrictionContext =
 		plannerRestrictionContext->relationRestrictionContext;
+	bool *taskRequiredForShardIndex = NULL;
+	List *prunedRelationShardList = NIL;
+	ListCell *prunedRelationShardCell = NULL;
+	bool isMultiShardQuery = false;
 
 	/* error if shards are not co-partitioned */
 	ErrorIfUnsupportedShardDistribution(subquery);
 
-	/* get list of all range tables in subquery tree */
-	ExtractRangeTableRelationWalker((Node *) subquery, &rangeTableList);
-
-	/*
-	 * Find the first relation that is not a reference table. We'll use the shards
-	 * of that relation as the target shards.
-	 */
-	foreach(rangeTableCell, rangeTableList)
+	if (list_length(relationRestrictionContext->relationRestrictionList) == 0)
 	{
-		RangeTblEntry *rangeTableEntry = (RangeTblEntry *) lfirst(rangeTableCell);
+		ereport(ERROR, (errmsg("cannot handle complex subqueries when the "
+							   "router executor is disabled")));
+	}
+
+	/* defaults to be used if this is a reference table-only query */
+	minShardOffset = 0;
+	maxShardOffset = 0;
+
+	prunedRelationShardList = TargetShardIntervalsForQuery(subquery,
+														   relationRestrictionContext,
+														   &isMultiShardQuery);
+
+	forboth(prunedRelationShardCell, prunedRelationShardList,
+			restrictionCell, relationRestrictionContext->relationRestrictionList)
+	{
+		RelationRestriction *relationRestriction =
+			(RelationRestriction *) lfirst(restrictionCell);
+		Oid relationId = relationRestriction->relationId;
+		List *prunedShardList = (List *) lfirst(prunedRelationShardCell);
+		ListCell *shardIntervalCell = NULL;
 		DistTableCacheEntry *cacheEntry = NULL;
 
-		relationId = rangeTableEntry->relid;
 		cacheEntry = DistributedTableCacheEntry(relationId);
 		if (cacheEntry->partitionMethod == DISTRIBUTE_BY_NONE)
 		{
 			continue;
 		}
 
-		targetCacheEntry = DistributedTableCacheEntry(relationId);
-		break;
+		/* we expect distributed tables to have the same shard count */
+		if (shardCount > 0 && shardCount != cacheEntry->shardIntervalArrayLength)
+		{
+			ereport(ERROR, (errmsg("shard counts of co-located tables do not "
+								   "match")));
+		}
+
+		if (taskRequiredForShardIndex == NULL)
+		{
+			shardCount = cacheEntry->shardIntervalArrayLength;
+			taskRequiredForShardIndex = (bool *) palloc0(shardCount);
+
+			/* there is a distributed table, find the shard range */
+			minShardOffset = shardCount;
+			maxShardOffset = -1;
+		}
+
+		foreach(shardIntervalCell, prunedShardList)
+		{
+			ShardInterval *shardInterval = (ShardInterval *) lfirst(shardIntervalCell);
+			int shardIndex = shardInterval->shardIndex;
+
+			taskRequiredForShardIndex[shardIndex] = true;
+
+			if (shardIndex < minShardOffset)
+			{
+				minShardOffset = shardIndex;
+			}
+
+			if (shardIndex > maxShardOffset)
+			{
+				maxShardOffset = shardIndex;
+			}
+		}
 	}
 
 	/*
-	 * That means all tables are reference tables and we can pick any any of them
-	 * as an anchor table.
+	 * To avoid iterating through all shards indexes we keep the minimum and maximum
+	 * offsets of shards that were not pruned away. This optimisation is primarily
+	 * relevant for queries on range-distributed tables that, due to range filters,
+	 * prune to a small number of adjacent shards.
+	 *
+	 * In other cases, such as an OR condition on a hash-distributed table, we may
+	 * still visit most or all shards even if some of them were pruned away. However,
+	 * given that hash-distributed tables typically only have a few shards the
+	 * iteration is still very fast.
 	 */
-	if (targetCacheEntry == NULL)
+	for (shardOffset = minShardOffset; shardOffset <= maxShardOffset; shardOffset++)
 	{
-		RangeTblEntry *rangeTableEntry = NULL;
-
-		if (list_length(rangeTableList) == 0)
-		{
-			/*
-			 * User disabled the router planner and forced planner go through
-			 * subquery pushdown, but we cannot continue anymore.
-			 */
-			ereport(ERROR, (errmsg("cannot handle complex subqueries when the "
-								   "router executor is disabled")));
-		}
-
-		rangeTableEntry = (RangeTblEntry *) linitial(rangeTableList);
-		relationId = rangeTableEntry->relid;
-		targetCacheEntry = DistributedTableCacheEntry(relationId);
-	}
-
-	shardCount = targetCacheEntry->shardIntervalArrayLength;
-	for (shardOffset = 0; shardOffset < shardCount; shardOffset++)
-	{
-		ShardInterval *targetShardInterval =
-			targetCacheEntry->sortedShardIntervalArray[shardOffset];
 		Task *subqueryTask = NULL;
 
-		subqueryTask = SubqueryTaskCreate(subquery, targetShardInterval,
-										  relationRestrictionContext, taskIdIndex);
-
-
-		/* add the task if it could be created */
-		if (subqueryTask != NULL)
+		if (taskRequiredForShardIndex != NULL && !taskRequiredForShardIndex[shardOffset])
 		{
-			subqueryTask->jobId = jobId;
-			sqlTaskList = lappend(sqlTaskList, subqueryTask);
-
-			++taskIdIndex;
+			/* this shard index is pruned away for all relations */
+			continue;
 		}
+
+		subqueryTask = SubqueryTaskCreate(subquery, shardOffset,
+										  relationRestrictionContext, taskIdIndex);
+		subqueryTask->jobId = jobId;
+		sqlTaskList = lappend(sqlTaskList, subqueryTask);
+
+		++taskIdIndex;
 	}
 
 	return sqlTaskList;
@@ -2224,9 +2260,13 @@ ErrorIfUnsupportedShardDistribution(Query *query)
 
 /*
  * CoPartitionedTables checks if given two distributed tables have 1-to-1 shard
- * partitioning.
+ * placement matching. It first checks for the shard count, if tables don't have
+ * same amount shard then it returns false. Note that, if any table does not
+ * have any shard, it returns true. If two tables have same amount of shards,
+ * we check colocationIds for hash distributed tables and shardInterval's min
+ * max values for append and range distributed tables.
  */
-static bool
+bool
 CoPartitionedTables(Oid firstRelationId, Oid secondRelationId)
 {
 	bool coPartitionedTables = true;
@@ -2264,10 +2304,25 @@ CoPartitionedTables(Oid firstRelationId, Oid secondRelationId)
 	}
 
 	/*
+	 * For hash distributed tables two tables are accepted as colocated only if
+	 * they have the same colocationId. Otherwise they may have same minimum and
+	 * maximum values for each shard interval, yet hash function may result with
+	 * different values for the same value. int vs bigint can be given as an
+	 * example.
+	 */
+	if (firstTableCache->partitionMethod == DISTRIBUTE_BY_HASH ||
+		secondTableCache->partitionMethod == DISTRIBUTE_BY_HASH)
+	{
+		return false;
+	}
+
+
+	/*
 	 * If not known to be colocated check if the remaining shards are
 	 * anyway. Do so by comparing the shard interval arrays that are sorted on
 	 * interval minimum values. Then it compares every shard interval in order
-	 * and if any pair of shard intervals are not equal it returns false.
+	 * and if any pair of shard intervals are not equal or they are not located
+	 * in the same node it returns false.
 	 */
 	for (intervalIndex = 0; intervalIndex < firstListShardCount; intervalIndex++)
 	{
@@ -2277,7 +2332,8 @@ CoPartitionedTables(Oid firstRelationId, Oid secondRelationId)
 		bool shardIntervalsEqual = ShardIntervalsEqual(comparisonFunction,
 													   firstInterval,
 													   secondInterval);
-		if (!shardIntervalsEqual)
+		if (!shardIntervalsEqual || !CoPlacedShardIntervals(firstInterval,
+															secondInterval))
 		{
 			coPartitionedTables = false;
 			break;
@@ -2285,6 +2341,45 @@ CoPartitionedTables(Oid firstRelationId, Oid secondRelationId)
 	}
 
 	return coPartitionedTables;
+}
+
+
+/*
+ * CoPlacedShardIntervals checks whether the given intervals located in the same nodes.
+ */
+static bool
+CoPlacedShardIntervals(ShardInterval *firstInterval, ShardInterval *secondInterval)
+{
+	List *firstShardPlacementList = ShardPlacementList(firstInterval->shardId);
+	List *secondShardPlacementList = ShardPlacementList(secondInterval->shardId);
+	ListCell *firstShardPlacementCell = NULL;
+	ListCell *secondShardPlacementCell = NULL;
+
+	/* Shards must have same number of placements */
+	if (list_length(firstShardPlacementList) != list_length(secondShardPlacementList))
+	{
+		return false;
+	}
+
+	firstShardPlacementList = SortList(firstShardPlacementList, CompareShardPlacements);
+	secondShardPlacementList = SortList(secondShardPlacementList, CompareShardPlacements);
+
+	forboth(firstShardPlacementCell, firstShardPlacementList, secondShardPlacementCell,
+			secondShardPlacementList)
+	{
+		ShardPlacement *firstShardPlacement = (ShardPlacement *) lfirst(
+			firstShardPlacementCell);
+		ShardPlacement *secondShardPlacement = (ShardPlacement *) lfirst(
+			secondShardPlacementCell);
+
+		if (strcmp(firstShardPlacement->nodeName, secondShardPlacement->nodeName) != 0 ||
+			firstShardPlacement->nodePort != secondShardPlacement->nodePort)
+		{
+			return false;
+		}
+	}
+
+	return true;
 }
 
 
@@ -2326,96 +2421,76 @@ ShardIntervalsEqual(FmgrInfo *comparisonFunction, ShardInterval *firstInterval,
 
 /*
  * SubqueryTaskCreate creates a sql task by replacing the target
- * shardInterval's boundary value.. Then performs the normal
- * shard pruning on the subquery via RouterSelectQuery().
- *
- * The function errors out if the subquery is not router select query (i.e.,
- * subqueries with non equi-joins.).
+ * shardInterval's boundary value.
  */
 static Task *
-SubqueryTaskCreate(Query *originalQuery, ShardInterval *shardInterval,
-				   RelationRestrictionContext *restrictionContext,
-				   uint32 taskId)
+SubqueryTaskCreate(Query *originalQuery, int shardIndex,
+				   RelationRestrictionContext *restrictionContext, uint32 taskId)
 {
 	Query *taskQuery = copyObject(originalQuery);
 
-	uint64 shardId = shardInterval->shardId;
-	Oid distributedTableId = shardInterval->relationId;
 	StringInfo queryString = makeStringInfo();
 	ListCell *restrictionCell = NULL;
 	Task *subqueryTask = NULL;
-	List *selectPlacementList = NIL;
-	uint64 selectAnchorShardId = INVALID_SHARD_ID;
+	List *taskShardList = NIL;
 	List *relationShardList = NIL;
+	List *selectPlacementList = NIL;
 	uint64 jobId = INVALID_JOB_ID;
-	bool replacePrunedQueryWithDummy = false;
-	RelationRestrictionContext *copiedRestrictionContext =
-		CopyRelationRestrictionContext(restrictionContext);
-	List *shardOpExpressions = NIL;
-	RestrictInfo *shardRestrictionList = NULL;
-	DeferredErrorMessage *planningError = NULL;
-	bool multiShardModifQuery = false;
+	uint64 anchorShardId = INVALID_SHARD_ID;
 
 	/*
-	 * Add the restriction qual parameter value in all baserestrictinfos.
-	 * Note that this has to be done on a copy, as the originals are needed
-	 * per target shard interval.
+	 * Find the relevant shard out of each relation for this task.
 	 */
-	foreach(restrictionCell, copiedRestrictionContext->relationRestrictionList)
+	foreach(restrictionCell, restrictionContext->relationRestrictionList)
 	{
-		RelationRestriction *restriction = lfirst(restrictionCell);
-		Index rteIndex = restriction->index;
-		List *originalBaseRestrictInfo = restriction->relOptInfo->baserestrictinfo;
-		List *extendedBaseRestrictInfo = originalBaseRestrictInfo;
+		RelationRestriction *relationRestriction =
+			(RelationRestriction *) lfirst(restrictionCell);
+		Oid relationId = relationRestriction->relationId;
+		DistTableCacheEntry *cacheEntry = NULL;
+		ShardInterval *shardInterval = NULL;
+		RelationShard *relationShard = NULL;
 
-		shardOpExpressions = ShardIntervalOpExpressions(shardInterval, rteIndex);
-
-		/* means it is a reference table and do not add any shard interval info */
-		if (shardOpExpressions == NIL)
+		cacheEntry = DistributedTableCacheEntry(relationId);
+		if (cacheEntry->partitionMethod == DISTRIBUTE_BY_NONE)
 		{
-			continue;
+			/* reference table only has one shard */
+			shardInterval = cacheEntry->sortedShardIntervalArray[0];
+
+			/* only use reference table as anchor shard if none exists yet */
+			if (anchorShardId == INVALID_SHARD_ID)
+			{
+				anchorShardId = shardInterval->shardId;
+			}
+		}
+		else
+		{
+			/* use the shard from a specific index */
+			shardInterval = cacheEntry->sortedShardIntervalArray[shardIndex];
+
+			/* use a shard from a distributed table as the anchor shard */
+			anchorShardId = shardInterval->shardId;
 		}
 
-		shardRestrictionList = make_simple_restrictinfo((Expr *) shardOpExpressions);
-		extendedBaseRestrictInfo = lappend(extendedBaseRestrictInfo,
-										   shardRestrictionList);
+		taskShardList = lappend(taskShardList, list_make1(shardInterval));
 
-		restriction->relOptInfo->baserestrictinfo = extendedBaseRestrictInfo;
+		relationShard = CitusMakeNode(RelationShard);
+		relationShard->relationId = shardInterval->relationId;
+		relationShard->shardId = shardInterval->shardId;
+
+		relationShardList = lappend(relationShardList, relationShard);
 	}
 
-	/* mark that we don't want the router planner to generate dummy hosts/queries */
-	replacePrunedQueryWithDummy = false;
-
-	/*
-	 * Use router select planner to decide on whether we can push down the query
-	 * or not. If we can, we also rely on the side-effects that all RTEs have been
-	 * updated to point to the relevant nodes and selectPlacementList is determined.
-	 */
-	planningError = PlanRouterQuery(taskQuery, copiedRestrictionContext,
-									&selectPlacementList, &selectAnchorShardId,
-									&relationShardList, replacePrunedQueryWithDummy,
-									&multiShardModifQuery);
-
-	Assert(!multiShardModifQuery);
-
-	/* we don't expect to this this error but keeping it as a precaution for future changes */
-	if (planningError)
-	{
-		ereport(ERROR, (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-						errmsg("cannot perform distributed planning for the given "
-							   "query"),
-						errdetail("Select query cannot be pushed down to the worker.")));
-	}
-
-	/* ensure that we do not send queries where select is pruned away completely */
+	selectPlacementList = WorkersContainingAllShards(taskShardList);
 	if (list_length(selectPlacementList) == 0)
 	{
-		ereport(DEBUG2, (errmsg("Skipping the target shard interval " UINT64_FORMAT
-								" because SELECT query is pruned away for the interval",
-								shardId)));
-
-		return NULL;
+		ereport(ERROR, (errmsg("cannot find a worker that has active placements for all "
+							   "shards in the query")));
 	}
+
+	/*
+	 * Augment the relations in the query with the shard IDs.
+	 */
+	UpdateRelationToShardNames((Node *) taskQuery, relationShardList);
 
 	/*
 	 * Ands are made implicit during shard pruning, as predicate comparison and
@@ -2427,13 +2502,12 @@ SubqueryTaskCreate(Query *originalQuery, ShardInterval *shardInterval,
 		(Node *) make_ands_explicit((List *) taskQuery->jointree->quals);
 
 	/* and generate the full query string */
-	deparse_shard_query(taskQuery, distributedTableId, shardInterval->shardId,
-						queryString);
+	pg_get_query_def(taskQuery, queryString);
 	ereport(DEBUG4, (errmsg("distributed statement: %s", queryString->data)));
 
 	subqueryTask = CreateBasicTask(jobId, taskId, SQL_TASK, queryString->data);
 	subqueryTask->dependedTaskList = NULL;
-	subqueryTask->anchorShardId = shardInterval->shardId;
+	subqueryTask->anchorShardId = anchorShardId;
 	subqueryTask->taskPlacementList = selectPlacementList;
 	subqueryTask->upsertQuery = false;
 	subqueryTask->relationShardList = relationShardList;
@@ -3753,8 +3827,9 @@ FragmentIntervalString(ShardInterval *fragmentInterval)
 
 
 /*
- * DataFetchTaskList builds a data fetch task for every shard in the given shard
- * list, appends these data fetch tasks into a list, and returns this list.
+ * DataFetchTaskList builds a merge fetch task for every remote query result
+ * in the given fragment list, appends these merge fetch tasks into a list,
+ * and returns this list.
  */
 static List *
 DataFetchTaskList(uint64 jobId, uint32 taskIdIndex, List *fragmentList)
@@ -3765,20 +3840,7 @@ DataFetchTaskList(uint64 jobId, uint32 taskIdIndex, List *fragmentList)
 	foreach(fragmentCell, fragmentList)
 	{
 		RangeTableFragment *fragment = (RangeTableFragment *) lfirst(fragmentCell);
-		if (fragment->fragmentType == CITUS_RTE_RELATION)
-		{
-			ShardInterval *shardInterval = fragment->fragmentReference;
-			uint64 shardId = shardInterval->shardId;
-			StringInfo shardFetchQueryString = ShardFetchQueryString(shardId);
-
-			Task *shardFetchTask = CreateBasicTask(jobId, taskIdIndex, SHARD_FETCH_TASK,
-												   shardFetchQueryString->data);
-			shardFetchTask->shardId = shardId;
-
-			dataFetchTaskList = lappend(dataFetchTaskList, shardFetchTask);
-			taskIdIndex++;
-		}
-		else if (fragment->fragmentType == CITUS_RTE_REMOTE_QUERY)
+		if (fragment->fragmentType == CITUS_RTE_REMOTE_QUERY)
 		{
 			Task *mergeTask = (Task *) fragment->fragmentReference;
 			char *undefinedQueryString = NULL;
@@ -3794,136 +3856,6 @@ DataFetchTaskList(uint64 jobId, uint32 taskIdIndex, List *fragmentList)
 	}
 
 	return dataFetchTaskList;
-}
-
-
-/*
- * ShardFetchQueryString constructs a query string to fetch the given shard from
- * the shards' placements.
- */
-StringInfo
-ShardFetchQueryString(uint64 shardId)
-{
-	StringInfo shardFetchQuery = NULL;
-	uint64 shardLength = ShardLength(shardId);
-
-	/* construct two array strings for node names and port numbers */
-	List *shardPlacements = FinalizedShardPlacementList(shardId);
-	StringInfo nodeNameArrayString = NodeNameArrayString(shardPlacements);
-	StringInfo nodePortArrayString = NodePortArrayString(shardPlacements);
-
-	/* check storage type to create the correct query string */
-	ShardInterval *shardInterval = LoadShardInterval(shardId);
-	char storageType = shardInterval->storageType;
-	char *shardSchemaName = NULL;
-	char *shardTableName = NULL;
-
-	/* construct the shard name */
-	Oid shardSchemaId = get_rel_namespace(shardInterval->relationId);
-	char *tableName = get_rel_name(shardInterval->relationId);
-
-	shardSchemaName = get_namespace_name(shardSchemaId);
-	shardTableName = pstrdup(tableName);
-	AppendShardIdToName(&shardTableName, shardId);
-
-	shardFetchQuery = makeStringInfo();
-	if (storageType == SHARD_STORAGE_TABLE || storageType == SHARD_STORAGE_RELAY ||
-		storageType == SHARD_STORAGE_COLUMNAR)
-	{
-		if (strcmp(shardSchemaName, "public") != 0)
-		{
-			char *qualifiedTableName = quote_qualified_identifier(shardSchemaName,
-																  shardTableName);
-
-			appendStringInfo(shardFetchQuery, TABLE_FETCH_COMMAND, qualifiedTableName,
-							 shardLength, nodeNameArrayString->data,
-							 nodePortArrayString->data);
-		}
-		else
-		{
-			appendStringInfo(shardFetchQuery, TABLE_FETCH_COMMAND, shardTableName,
-							 shardLength, nodeNameArrayString->data,
-							 nodePortArrayString->data);
-		}
-	}
-	else if (storageType == SHARD_STORAGE_FOREIGN)
-	{
-		if (strcmp(shardSchemaName, "public") != 0)
-		{
-			char *qualifiedTableName = quote_qualified_identifier(shardSchemaName,
-																  shardTableName);
-
-			appendStringInfo(shardFetchQuery, FOREIGN_FETCH_COMMAND, qualifiedTableName,
-							 shardLength, nodeNameArrayString->data,
-							 nodePortArrayString->data);
-		}
-		else
-		{
-			appendStringInfo(shardFetchQuery, FOREIGN_FETCH_COMMAND, shardTableName,
-							 shardLength, nodeNameArrayString->data,
-							 nodePortArrayString->data);
-		}
-	}
-
-	return shardFetchQuery;
-}
-
-
-/*
- * NodeNameArrayString extracts the node names from the given node list, stores
- * these node names in an array, and returns the array's string representation.
- */
-static StringInfo
-NodeNameArrayString(List *shardPlacementList)
-{
-	StringInfo nodeNameArrayString = NULL;
-	ListCell *shardPlacementCell = NULL;
-
-	uint32 nodeNameCount = (uint32) list_length(shardPlacementList);
-	Datum *nodeNameArray = palloc0(nodeNameCount * sizeof(Datum));
-	uint32 nodeNameIndex = 0;
-
-	foreach(shardPlacementCell, shardPlacementList)
-	{
-		ShardPlacement *shardPlacement = (ShardPlacement *) lfirst(shardPlacementCell);
-		Datum nodeName = CStringGetDatum(shardPlacement->nodeName);
-
-		nodeNameArray[nodeNameIndex] = nodeName;
-		nodeNameIndex++;
-	}
-
-	nodeNameArrayString = DatumArrayString(nodeNameArray, nodeNameCount, CSTRINGOID);
-
-	return nodeNameArrayString;
-}
-
-
-/*
- * NodePortArrayString extracts the node ports from the given node list, stores
- * these node ports in an array, and returns the array's string representation.
- */
-static StringInfo
-NodePortArrayString(List *shardPlacementList)
-{
-	StringInfo nodePortArrayString = NULL;
-	ListCell *shardPlacementCell = NULL;
-
-	uint32 nodePortCount = (uint32) list_length(shardPlacementList);
-	Datum *nodePortArray = palloc0(nodePortCount * sizeof(Datum));
-	uint32 nodePortIndex = 0;
-
-	foreach(shardPlacementCell, shardPlacementList)
-	{
-		ShardPlacement *shardPlacement = (ShardPlacement *) lfirst(shardPlacementCell);
-		Datum nodePort = UInt32GetDatum(shardPlacement->nodePort);
-
-		nodePortArray[nodePortIndex] = nodePort;
-		nodePortIndex++;
-	}
-
-	nodePortArrayString = DatumArrayString(nodePortArray, nodePortCount, INT4OID);
-
-	return nodePortArrayString;
 }
 
 
@@ -4147,10 +4079,8 @@ AnchorShardId(List *fragmentList, uint32 anchorRangeTableId)
 
 /*
  * PruneSqlTaskDependencies iterates over each sql task from the given sql task
- * list, and prunes away any data fetch tasks which are redundant or not needed
- * for the completion of that task. Specifically the function prunes away data
- * fetch tasks for the anchor shard and any merge-fetch tasks, as the task
- * assignment algorithm ensures co-location of these tasks.
+ * list, and prunes away merge-fetch tasks, as the task assignment algorithm
+ * ensures co-location of these tasks.
  */
 static List *
 PruneSqlTaskDependencies(List *sqlTaskList)
@@ -4168,17 +4098,11 @@ PruneSqlTaskDependencies(List *sqlTaskList)
 			Task *dataFetchTask = (Task *) lfirst(dependedTaskCell);
 
 			/*
-			 * If we have a shard fetch task for the anchor shard, or if we have
-			 * a merge fetch task, our task assignment algorithm makes sure that
-			 * the sql task is colocated with the anchor shard / merge task. We
-			 * can therefore prune out this data fetch task.
+			 * If we have a merge fetch task, our task assignment algorithm makes
+			 * sure that the sql task is colocated with the anchor shard / merge
+			 * task. We can therefore prune out this data fetch task.
 			 */
-			if (dataFetchTask->taskType == SHARD_FETCH_TASK &&
-				dataFetchTask->shardId != sqlTask->anchorShardId)
-			{
-				prunedDependedTaskList = lappend(prunedDependedTaskList, dataFetchTask);
-			}
-			else if (dataFetchTask->taskType == MERGE_FETCH_TASK)
+			if (dataFetchTask->taskType == MERGE_FETCH_TASK)
 			{
 				Task *mergeTaskReference = NULL;
 				List *mergeFetchDependencyList = dataFetchTask->dependedTaskList;
@@ -4822,31 +4746,6 @@ TaskListDifference(const List *list1, const List *list2)
 
 
 /*
- * TaskListUnion generate the union of two tasks lists. This is calculated by
- * copying list1 via list_copy(), then adding to it all the members of list2
- * that aren't already in list1.
- */
-List *
-TaskListUnion(const List *list1, const List *list2)
-{
-	const ListCell *taskCell = NULL;
-	List *resultList = NIL;
-
-	resultList = list_copy(list1);
-
-	foreach(taskCell, list2)
-	{
-		if (!TaskListMember(resultList, lfirst(taskCell)))
-		{
-			resultList = lappend(resultList, lfirst(taskCell));
-		}
-	}
-
-	return resultList;
-}
-
-
-/*
  * AssignAnchorShardTaskList assigns locations to the given tasks based on the
  * configured task assignment policy. The distributed executor later sends these
  * tasks to their assigned locations for remote execution.
@@ -5403,8 +5302,7 @@ AssignDataFetchDependencies(List *taskList)
 		foreach(dependedTaskCell, dependedTaskList)
 		{
 			Task *dependedTask = (Task *) lfirst(dependedTaskCell);
-			if (dependedTask->taskType == SHARD_FETCH_TASK ||
-				dependedTask->taskType == MAP_OUTPUT_FETCH_TASK)
+			if (dependedTask->taskType == MAP_OUTPUT_FETCH_TASK)
 			{
 				dependedTask->taskPlacementList = task->taskPlacementList;
 			}

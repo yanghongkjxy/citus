@@ -359,6 +359,7 @@ OutShardInterval(OUTFUNC_ARGS)
 		outDatum(str, node->maxValue, node->valueTypeLen, node->valueByVal);
 
 	WRITE_UINT64_FIELD(shardId);
+	WRITE_INT_FIELD(shardIndex);
 }
 
 
@@ -477,7 +478,6 @@ OutTaskExecution(OUTFUNC_ARGS)
 	WRITE_INT64_FIELD(connectStartTime);
 	WRITE_UINT_FIELD(currentNodeIndex);
 	WRITE_UINT_FIELD(querySourceNodeIndex);
-	WRITE_INT_FIELD(dataFetchTaskIndex);
 	WRITE_UINT_FIELD(failureCount);
 }
 

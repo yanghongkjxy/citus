@@ -71,6 +71,7 @@
 #include "distributed/shard_pruning.h"
 #include "distributed/version_compat.h"
 #include "executor/executor.h"
+#include "libpq/pqformat.h"
 #include "nodes/makefuncs.h"
 #include "tsearch/ts_locale.h"
 #include "utils/builtins.h"
@@ -146,6 +147,10 @@ static bool CitusCopyDestReceiverReceive(TupleTableSlot *slot,
 										 DestReceiver *copyDest);
 static void CitusCopyDestReceiverShutdown(DestReceiver *destReceiver);
 static void CitusCopyDestReceiverDestroy(DestReceiver *destReceiver);
+
+
+/* exports for SQL callable functions */
+PG_FUNCTION_INFO_V1(citus_text_send_as_jsonb);
 
 
 /*
@@ -370,38 +375,34 @@ CopyToExistingShards(CopyStmt *copyStatement, char *completionTag)
 	dest->rStartup(dest, 0, tupleDescriptor);
 
 	/*
+	 * Below, we change a few fields in the Relation to control the behaviour
+	 * of BeginCopyFrom. However, we obviously should not do this in relcache
+	 * and therefore make a copy of the Relation.
+	 */
+	copiedDistributedRelation = (Relation) palloc0(sizeof(RelationData));
+	copiedDistributedRelationTuple = (Form_pg_class) palloc(CLASS_TUPLE_SIZE);
+
+	/*
+	 * There is no need to deep copy everything. We will just deep copy of the fields
+	 * we will change.
+	 */
+	memcpy(copiedDistributedRelation, distributedRelation, sizeof(RelationData));
+	memcpy(copiedDistributedRelationTuple, distributedRelation->rd_rel,
+		   CLASS_TUPLE_SIZE);
+
+	copiedDistributedRelation->rd_rel = copiedDistributedRelationTuple;
+	copiedDistributedRelation->rd_att = CreateTupleDescCopyConstr(tupleDescriptor);
+
+	/*
 	 * BeginCopyFrom opens all partitions of given partitioned table with relation_open
 	 * and it expects its caller to close those relations. We do not have direct access
 	 * to opened relations, thus we are changing relkind of partitioned tables so that
 	 * Postgres will treat those tables as regular relations and will not open its
 	 * partitions.
-	 *
-	 * We will make this change on copied version of distributed relation to not change
-	 * anything in relcache.
 	 */
 	if (PartitionedTable(tableId))
 	{
-		copiedDistributedRelation = (Relation) palloc0(sizeof(RelationData));
-		copiedDistributedRelationTuple = (Form_pg_class) palloc(CLASS_TUPLE_SIZE);
-
-		/*
-		 * There is no need to deep copy everything. We will just deep copy of the fields
-		 * we will change.
-		 */
-		memcpy(copiedDistributedRelation, distributedRelation, sizeof(RelationData));
-		memcpy(copiedDistributedRelationTuple, distributedRelation->rd_rel,
-			   CLASS_TUPLE_SIZE);
-
 		copiedDistributedRelationTuple->relkind = RELKIND_RELATION;
-		copiedDistributedRelation->rd_rel = copiedDistributedRelationTuple;
-	}
-	else
-	{
-		/*
-		 * If we are not dealing with partitioned table, copiedDistributedRelation is same
-		 * as distributedRelation.
-		 */
-		copiedDistributedRelation = distributedRelation;
 	}
 
 	/* initialize copy state to read from COPY data source */
@@ -1232,9 +1233,10 @@ ReportCopyError(MultiConnection *connection, PGresult *result)
 	{
 		/* probably a constraint violation, show remote message and detail */
 		char *remoteDetail = PQresultErrorField(result, PG_DIAG_MESSAGE_DETAIL);
+		bool haveDetail = remoteDetail != NULL;
 
 		ereport(ERROR, (errmsg("%s", remoteMessage),
-						errdetail("%s", remoteDetail)));
+						haveDetail ? errdetail("%s", remoteDetail) : 0));
 	}
 	else
 	{
@@ -1471,6 +1473,25 @@ ColumnOutputFunctions(TupleDesc rowDescriptor, bool binaryFormat)
 		TypeOutputFunctions(columnCount, columnTypes, binaryFormat);
 
 	return outputFunctions;
+}
+
+
+/*
+ * citus_text_send_as_jsonb sends a text as if it was a JSONB. This should only
+ * be used if the text is indeed valid JSON.
+ */
+Datum
+citus_text_send_as_jsonb(PG_FUNCTION_ARGS)
+{
+	text *inputText = PG_GETARG_TEXT_PP(0);
+	StringInfoData buf;
+	int version = 1;
+
+	pq_begintypsend(&buf);
+	pq_sendint(&buf, version, 1);
+	pq_sendtext(&buf, VARDATA_ANY(inputText), VARSIZE_ANY_EXHDR(inputText));
+
+	PG_RETURN_BYTEA_P(pq_endtypsend(&buf));
 }
 
 

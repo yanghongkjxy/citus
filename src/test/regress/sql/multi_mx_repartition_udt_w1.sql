@@ -9,10 +9,10 @@ SET citus.large_table_shard_count = 1;
 SET citus.task_executor_type = 'task-tracker';
 SET citus.log_multi_join_order = true;
 
--- Query that should result in a repartition join on int column, and be empty.
+-- Query that should result in a repartition
+-- join on int column, and be empty
 SELECT * FROM repartition_udt JOIN repartition_udt_other
-    ON repartition_udt.pk = repartition_udt_other.pk
-	WHERE repartition_udt.pk > 1;
+    ON repartition_udt.pk = repartition_udt_other.pk;
 
 SELECT * FROM repartition_udt JOIN repartition_udt_other
     ON repartition_udt.udtcol = repartition_udt_other.udtcol

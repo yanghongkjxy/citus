@@ -222,7 +222,7 @@ SELECT * FROM articles_hash_mx, position('om' in 'Thomas') WHERE author_id = 1 o
 -- subqueries are supported in FROM clause but they are not router plannable
 SELECT articles_hash_mx.id,test.word_count
 FROM articles_hash_mx, (SELECT id, word_count FROM articles_hash_mx) AS test WHERE test.id = articles_hash_mx.id
-ORDER BY articles_hash_mx.id;
+ORDER BY test.word_count DESC, articles_hash_mx.id LIMIT 5;
 
 
 SELECT articles_hash_mx.id,test.word_count
@@ -529,7 +529,8 @@ SELECT
 	FROM
 		articles_hash_mx
  	GROUP BY
-		author_id;
+		author_id
+	ORDER BY c;
 
 -- queries inside transactions can be router plannable
 BEGIN;

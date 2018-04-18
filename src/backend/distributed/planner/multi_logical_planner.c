@@ -85,23 +85,11 @@ static DeferredErrorMessage * DeferErrorIfUnsupportedSubqueryPushdown(Query *
 																	  PlannerRestrictionContext
 																	  *
 																	  plannerRestrictionContext);
-static RelationRestrictionContext * FilterRelationRestrictionContext(
-	RelationRestrictionContext *relationRestrictionContext,
-	Relids
-	queryRteIdentities);
-static JoinRestrictionContext * FilterJoinRestrictionContext(
-	JoinRestrictionContext *joinRestrictionContext, Relids
-	queryRteIdentities);
-static bool RangeTableArrayContainsAnyRTEIdentities(RangeTblEntry **rangeTableEntries, int
-													rangeTableArrayLength, Relids
-													queryRteIdentities);
-static Relids QueryRteIdentities(Query *queryTree);
 static DeferredErrorMessage * DeferErrorIfFromClauseRecurs(Query *queryTree);
 static bool ExtractSetOperationStatmentWalker(Node *node, List **setOperationList);
 static DeferredErrorMessage * DeferErrorIfUnsupportedTableCombination(Query *queryTree);
 static bool WindowPartitionOnDistributionColumn(Query *query);
 static bool AllTargetExpressionsAreColumnReferences(List *targetEntryList);
-static bool IsDistributedTableRTE(Node *node);
 static FieldSelect * CompositeFieldRecursive(Expr *expression, Query *query);
 static bool FullCompositeFieldList(List *compositeFieldList);
 static MultiNode * MultiNodeTree(Query *queryTree);
@@ -143,7 +131,7 @@ static MultiNode * ApplyJoinRule(MultiNode *leftNode, MultiNode *rightNode,
 								 JoinRuleType ruleType, Var *partitionColumn,
 								 JoinType joinType, List *joinClauseList);
 static RuleApplyFunction JoinRuleApplyFunction(JoinRuleType ruleType);
-static MultiNode * ApplyBroadcastJoin(MultiNode *leftNode, MultiNode *rightNode,
+static MultiNode * ApplyReferenceJoin(MultiNode *leftNode, MultiNode *rightNode,
 									  Var *partitionColumn, JoinType joinType,
 									  List *joinClauses);
 static MultiNode * ApplyLocalJoin(MultiNode *leftNode, MultiNode *rightNode,
@@ -164,16 +152,16 @@ static MultiNode * ApplyCartesianProduct(MultiNode *leftNode, MultiNode *rightNo
  * functions will be removed with upcoming subqery changes.
  */
 static bool ShouldUseSubqueryPushDown(Query *originalQuery, Query *rewrittenQuery);
+static bool JoinTreeContainsSubqueryWalker(Node *joinTreeNode, void *context);
 static bool IsFunctionRTE(Node *node);
-static bool FindNodeCheck(Node *node, bool (*check)(Node *));
+static bool IsNodeQuery(Node *node);
 static MultiNode * SubqueryMultiNodeTree(Query *originalQuery,
 										 Query *queryTree,
 										 PlannerRestrictionContext *
 										 plannerRestrictionContext);
-static List * SublinkList(Query *originalQuery);
-static bool ExtractSublinkWalker(Node *node, List **sublinkList);
 static MultiNode * SubqueryPushdownMultiNodeTree(Query *queryTree);
 
+static void FlattenJoinVars(List *columnList, Query *queryTree);
 static List * CreateSubqueryTargetEntryList(List *columnList);
 static void UpdateVarMappingsForExtendedOpNode(List *columnList,
 											   List *subqueryTargetEntryList);
@@ -225,13 +213,14 @@ static bool
 ShouldUseSubqueryPushDown(Query *originalQuery, Query *rewrittenQuery)
 {
 	List *qualifierList = NIL;
+	StringInfo errorMessage = NULL;
 
 	/*
 	 * We check the existence of subqueries in FROM clause on the modified query
 	 * given that if postgres already flattened the subqueries, MultiPlanTree()
 	 * can plan corresponding distributed plan.
 	 */
-	if (SubqueryEntryList(rewrittenQuery) != NIL)
+	if (JoinTreeContainsSubquery(rewrittenQuery))
 	{
 		return true;
 	}
@@ -242,7 +231,7 @@ ShouldUseSubqueryPushDown(Query *originalQuery, Query *rewrittenQuery)
 	 * standard_planner() may replace the sublinks with anti/semi joins and
 	 * MultiPlanTree() cannot plan such queries.
 	 */
-	if (SublinkList(originalQuery) != NIL)
+	if (WhereClauseContainsSubquery(originalQuery))
 	{
 		return true;
 	}
@@ -266,7 +255,63 @@ ShouldUseSubqueryPushDown(Query *originalQuery, Query *rewrittenQuery)
 		return true;
 	}
 
+	/* check if the query has a window function and it is safe to pushdown */
+	if (originalQuery->hasWindowFuncs &&
+		SafeToPushdownWindowFunction(originalQuery, &errorMessage))
+	{
+		return true;
+	}
+
 	return false;
+}
+
+
+/*
+ * JoinTreeContainsSubquery returns true if the input query contains any subqueries
+ * in the join tree (e.g., FROM clause).
+ */
+bool
+JoinTreeContainsSubquery(Query *query)
+{
+	FromExpr *joinTree = query->jointree;
+
+	if (!joinTree)
+	{
+		return false;
+	}
+
+	return JoinTreeContainsSubqueryWalker((Node *) joinTree, query);
+}
+
+
+/*
+ * JoinTreeContainsSubqueryWalker returns true if the input joinTreeNode
+ * references to a subquery. Otherwise, recurses into the expression.
+ */
+static bool
+JoinTreeContainsSubqueryWalker(Node *joinTreeNode, void *context)
+{
+	if (joinTreeNode == NULL)
+	{
+		return false;
+	}
+
+	if (IsA(joinTreeNode, RangeTblRef))
+	{
+		Query *query = (Query *) context;
+
+		RangeTblRef *rangeTableRef = (RangeTblRef *) joinTreeNode;
+		RangeTblEntry *rangeTableEntry = rt_fetch(rangeTableRef->rtindex, query->rtable);
+
+		if (rangeTableEntry->rtekind == RTE_SUBQUERY)
+		{
+			return true;
+		}
+
+		return false;
+	}
+
+	return expression_tree_walker(joinTreeNode, JoinTreeContainsSubqueryWalker, context);
 }
 
 
@@ -296,7 +341,7 @@ IsFunctionRTE(Node *node)
  * To call this function directly with an RTE, use:
  * range_table_walker(rte, FindNodeCheck, check, QTW_EXAMINE_RTES)
  */
-static bool
+bool
 FindNodeCheck(Node *node, bool (*check)(Node *))
 {
 	if (node == NULL)
@@ -324,53 +369,38 @@ FindNodeCheck(Node *node, bool (*check)(Node *))
 
 
 /*
- * SublinkList finds the subquery nodes in the where clause of the given query. Note
- * that the function should be called on the original query given that postgres
- * standard_planner() may convert the subqueries in WHERE clause to joins.
+ * WhereClauseContainsSubquery returns true if the input query contains
+ * any subqueries in the WHERE clause.
  */
-static List *
-SublinkList(Query *originalQuery)
+bool
+WhereClauseContainsSubquery(Query *query)
 {
-	FromExpr *joinTree = originalQuery->jointree;
+	FromExpr *joinTree = query->jointree;
 	Node *queryQuals = NULL;
-	List *sublinkList = NIL;
 
 	if (!joinTree)
 	{
-		return NIL;
+		return false;
 	}
 
 	queryQuals = joinTree->quals;
-	ExtractSublinkWalker(queryQuals, &sublinkList);
 
-	return sublinkList;
+	return FindNodeCheck(queryQuals, IsNodeQuery);
 }
 
 
 /*
- * ExtractSublinkWalker walks over a quals node, and finds all sublinks
- * in that node.
+ * IsNodeQuery returns true if the given node is a Query.
  */
 static bool
-ExtractSublinkWalker(Node *node, List **sublinkList)
+IsNodeQuery(Node *node)
 {
-	bool walkerResult = false;
 	if (node == NULL)
 	{
 		return false;
 	}
 
-	if (IsA(node, SubLink))
-	{
-		(*sublinkList) = lappend(*sublinkList, node);
-	}
-	else
-	{
-		walkerResult = expression_tree_walker(node, ExtractSublinkWalker,
-											  sublinkList);
-	}
-
-	return walkerResult;
+	return IsA(node, Query);
 }
 
 
@@ -614,210 +644,6 @@ DeferErrorIfUnsupportedSubqueryPushdown(Query *originalQuery,
 
 
 /*
- * FilterPlannerRestrictionForQuery gets a planner restriction context and
- * set of rte identities. It returns the restrictions that that appear
- * in the queryRteIdentities and returns a newly allocated
- * PlannerRestrictionContext. The function also sets all the other fields of
- * the PlannerRestrictionContext with respect to the filtered restrictions.
- */
-PlannerRestrictionContext *
-FilterPlannerRestrictionForQuery(PlannerRestrictionContext *plannerRestrictionContext,
-								 Query *query)
-{
-	PlannerRestrictionContext *filteredPlannerRestrictionContext = NULL;
-	int referenceRelationCount = 0;
-	int totalRelationCount = 0;
-
-	Relids queryRteIdentities = QueryRteIdentities(query);
-
-	RelationRestrictionContext *relationRestrictionContext =
-		plannerRestrictionContext->relationRestrictionContext;
-	JoinRestrictionContext *joinRestrictionContext =
-		plannerRestrictionContext->joinRestrictionContext;
-
-	RelationRestrictionContext *filteredRelationRestrictionContext =
-		FilterRelationRestrictionContext(relationRestrictionContext, queryRteIdentities);
-
-	JoinRestrictionContext *filtererdJoinRestrictionContext =
-		FilterJoinRestrictionContext(joinRestrictionContext, queryRteIdentities);
-
-	/* allocate the filtered planner restriction context and set all the fields */
-	filteredPlannerRestrictionContext = palloc0(sizeof(PlannerRestrictionContext));
-
-	filteredPlannerRestrictionContext->memoryContext =
-		plannerRestrictionContext->memoryContext;
-
-	totalRelationCount = list_length(
-		filteredRelationRestrictionContext->relationRestrictionList);
-	referenceRelationCount = ReferenceRelationCount(filteredRelationRestrictionContext);
-
-	filteredRelationRestrictionContext->allReferenceTables =
-		(totalRelationCount == referenceRelationCount);
-
-	/* we currently don't support local relations and we cannot come up to this point */
-	filteredRelationRestrictionContext->hasLocalRelation = false;
-	filteredRelationRestrictionContext->hasDistributedRelation = true;
-
-	/* finally set the relation and join restriction contexts */
-	filteredPlannerRestrictionContext->relationRestrictionContext =
-		filteredRelationRestrictionContext;
-	filteredPlannerRestrictionContext->joinRestrictionContext =
-		filtererdJoinRestrictionContext;
-
-	return filteredPlannerRestrictionContext;
-}
-
-
-/*
- * FilterRelationRestrictionContext gets a relation restriction context and
- * set of rte identities. It returns the relation restrictions that that appear
- * in the queryRteIdentities and returns a newly allocated
- * RelationRestrictionContext.
- */
-static RelationRestrictionContext *
-FilterRelationRestrictionContext(RelationRestrictionContext *relationRestrictionContext,
-								 Relids queryRteIdentities)
-{
-	RelationRestrictionContext *filteredRestrictionContext =
-		palloc0(sizeof(RelationRestrictionContext));
-
-	ListCell *relationRestrictionCell = NULL;
-
-	foreach(relationRestrictionCell, relationRestrictionContext->relationRestrictionList)
-	{
-		RelationRestriction *relationRestriction =
-			(RelationRestriction *) lfirst(relationRestrictionCell);
-
-		int rteIdentity = GetRTEIdentity(relationRestriction->rte);
-
-		if (bms_is_member(rteIdentity, queryRteIdentities))
-		{
-			filteredRestrictionContext->relationRestrictionList =
-				lappend(filteredRestrictionContext->relationRestrictionList,
-						relationRestriction);
-		}
-	}
-
-	return filteredRestrictionContext;
-}
-
-
-/*
- * FilterJoinRestrictionContext gets a join restriction context and
- * set of rte identities. It returns the join restrictions that that appear
- * in the queryRteIdentities and returns a newly allocated
- * JoinRestrictionContext.
- *
- * Note that the join restriction is added to the return context as soon as
- * any range table entry that appear in the join belongs to queryRteIdentities.
- */
-static JoinRestrictionContext *
-FilterJoinRestrictionContext(JoinRestrictionContext *joinRestrictionContext, Relids
-							 queryRteIdentities)
-{
-	JoinRestrictionContext *filtererdJoinRestrictionContext =
-		palloc0(sizeof(JoinRestrictionContext));
-
-	ListCell *joinRestrictionCell = NULL;
-
-	foreach(joinRestrictionCell, joinRestrictionContext->joinRestrictionList)
-	{
-		JoinRestriction *joinRestriction =
-			(JoinRestriction *) lfirst(joinRestrictionCell);
-		RangeTblEntry **rangeTableEntries =
-			joinRestriction->plannerInfo->simple_rte_array;
-		int rangeTableArrayLength = joinRestriction->plannerInfo->simple_rel_array_size;
-
-		if (RangeTableArrayContainsAnyRTEIdentities(rangeTableEntries,
-													rangeTableArrayLength,
-													queryRteIdentities))
-		{
-			filtererdJoinRestrictionContext->joinRestrictionList = lappend(
-				filtererdJoinRestrictionContext->joinRestrictionList,
-				joinRestriction);
-		}
-	}
-
-	return filtererdJoinRestrictionContext;
-}
-
-
-/*
- * RangeTableArrayContainsAnyRTEIdentities returns true if any of the range table entries
- * int rangeTableEntries array is an range table relation specified in queryRteIdentities.
- */
-static bool
-RangeTableArrayContainsAnyRTEIdentities(RangeTblEntry **rangeTableEntries, int
-										rangeTableArrayLength, Relids queryRteIdentities)
-{
-	int rteIndex = 0;
-
-	/* simple_rte_array starts from 1, see plannerInfo struct */
-	for (rteIndex = 1; rteIndex < rangeTableArrayLength; ++rteIndex)
-	{
-		RangeTblEntry *rangeTableEntry = rangeTableEntries[rteIndex];
-		List *rangeTableRelationList = NULL;
-		ListCell *rteRelationCell = NULL;
-
-		/*
-		 * Get list of all RTE_RELATIONs in the given range table entry
-		 * (i.e.,rangeTableEntry could be a subquery where we're interested
-		 * in relations).
-		 */
-		ExtractRangeTableRelationWalker((Node *) rangeTableEntry,
-										&rangeTableRelationList);
-
-		foreach(rteRelationCell, rangeTableRelationList)
-		{
-			RangeTblEntry *rteRelation = (RangeTblEntry *) lfirst(rteRelationCell);
-			int rteIdentity = 0;
-
-			Assert(rteRelation->rtekind == RTE_RELATION);
-
-			rteIdentity = GetRTEIdentity(rteRelation);
-			if (bms_is_member(rteIdentity, queryRteIdentities))
-			{
-				return true;
-			}
-		}
-	}
-
-	return false;
-}
-
-
-/*
- * QueryRteIdentities gets a queryTree, find get all the rte identities assigned by
- * us.
- */
-static Relids
-QueryRteIdentities(Query *queryTree)
-{
-	List *rangeTableList = NULL;
-	ListCell *rangeTableCell = NULL;
-	Relids queryRteIdentities = NULL;
-
-	/* extract range table entries for simple relations only */
-	ExtractRangeTableRelationWalker((Node *) queryTree, &rangeTableList);
-
-	foreach(rangeTableCell, rangeTableList)
-	{
-		RangeTblEntry *rangeTableEntry = (RangeTblEntry *) lfirst(rangeTableCell);
-		int rteIdentity = 0;
-
-		/* we're only interested in relations */
-		Assert(rangeTableEntry->rtekind == RTE_RELATION);
-
-		rteIdentity = GetRTEIdentity(rangeTableEntry);
-
-		queryRteIdentities = bms_add_member(queryRteIdentities, rteIdentity);
-	}
-
-	return queryRteIdentities;
-}
-
-
-/*
  * DeferErrorIfFromClauseRecurs returns a deferred error if the
  * given query is not suitable for subquery pushdown.
  *
@@ -872,7 +698,8 @@ DeferErrorIfFromClauseRecurs(Query *queryTree)
 							 "cannot pushdown the subquery",
 							 "Reference tables are not allowed in FROM "
 							 "clause when the query has subqueries in "
-							 "WHERE clause", NULL);
+							 "WHERE clause and it references a column "
+							 "from another query", NULL);
 	}
 	else if (recurType == RECURRING_TUPLES_FUNCTION)
 	{
@@ -880,7 +707,8 @@ DeferErrorIfFromClauseRecurs(Query *queryTree)
 							 "cannot pushdown the subquery",
 							 "Functions are not allowed in FROM "
 							 "clause when the query has subqueries in "
-							 "WHERE clause", NULL);
+							 "WHERE clause and it references a column "
+							 "from another query", NULL);
 	}
 	else if (recurType == RECURRING_TUPLES_RESULT_FUNCTION)
 	{
@@ -888,7 +716,8 @@ DeferErrorIfFromClauseRecurs(Query *queryTree)
 							 "cannot pushdown the subquery",
 							 "Complex subqueries and CTEs are not allowed in "
 							 "the FROM clause when the query has subqueries in the "
-							 "WHERE clause", NULL);
+							 "WHERE clause and it references a column "
+							 "from another query", NULL);
 	}
 	else if (recurType == RECURRING_TUPLES_EMPTY_JOIN_TREE)
 	{
@@ -896,7 +725,8 @@ DeferErrorIfFromClauseRecurs(Query *queryTree)
 							 "cannot pushdown the subquery",
 							 "Subqueries without FROM are not allowed in FROM "
 							 "clause when the outer query has subqueries in "
-							 "WHERE clause", NULL);
+							 "WHERE clause and it references a column "
+							 "from another query", NULL);
 	}
 
 	/*
@@ -1029,8 +859,8 @@ DeferErrorIfCannotPushdownSubquery(Query *subqueryTree, bool outerMostQueryHasLi
 	 * We support window functions when the window function
 	 * is partitioned on distribution column.
 	 */
-	if (subqueryTree->windowClause && !SafeToPushdownWindowFunction(subqueryTree,
-																	&errorInfo))
+	if (subqueryTree->hasWindowFuncs && !SafeToPushdownWindowFunction(subqueryTree,
+																	  &errorInfo))
 	{
 		errorDetail = (char *) errorInfo->data;
 		preconditionsSatisfied = false;
@@ -1545,7 +1375,7 @@ QueryContainsDistributedTableRTE(Query *query)
  * is a range table relation entry that points to a distributed
  * relation (i.e., excluding reference tables).
  */
-static bool
+bool
 IsDistributedTableRTE(Node *node)
 {
 	RangeTblEntry *rangeTableEntry = NULL;
@@ -2258,6 +2088,7 @@ DeferErrorIfQueryNotSupported(Query *queryTree)
 	bool hasComplexJoinOrder = false;
 	bool hasComplexRangeTableType = false;
 	bool preconditionsSatisfied = true;
+	StringInfo errorInfo = NULL;
 	const char *errorHint = NULL;
 	const char *joinHint = "Consider joining tables on partition column and have "
 						   "equal filter on joining columns.";
@@ -2268,7 +2099,7 @@ DeferErrorIfQueryNotSupported(Query *queryTree)
 	 * There could be Sublinks in the target list as well. To produce better
 	 * error messages we're checking sublinks in the where clause.
 	 */
-	if (queryTree->hasSubLinks && SublinkList(queryTree) == NIL)
+	if (queryTree->hasSubLinks && !WhereClauseContainsSubquery(queryTree))
 	{
 		preconditionsSatisfied = false;
 		errorMessage = "could not run distributed query with subquery outside the "
@@ -2276,15 +2107,16 @@ DeferErrorIfQueryNotSupported(Query *queryTree)
 		errorHint = filterHint;
 	}
 
-	if (queryTree->hasWindowFuncs)
+	if (queryTree->hasWindowFuncs &&
+		!SafeToPushdownWindowFunction(queryTree, &errorInfo))
 	{
 		preconditionsSatisfied = false;
 		errorMessage = "could not run distributed query because the window "
 					   "function that is used cannot be pushed down";
 		errorHint = "Window functions are supported in two ways. Either add "
 					"an equality filter on the distributed tables' partition "
-					"column or use the window functions inside a subquery with "
-					"a PARTITION BY clause containing the distribution column";
+					"column or use the window functions with a PARTITION BY "
+					"clause containing the distribution column";
 	}
 
 	if (queryTree->setOperations)
@@ -3314,6 +3146,8 @@ MultiExtendedOpNode(Query *queryTree)
 	extendedOpNode->havingQual = queryTree->havingQual;
 	extendedOpNode->distinctClause = queryTree->distinctClause;
 	extendedOpNode->hasDistinctOn = queryTree->hasDistinctOn;
+	extendedOpNode->hasWindowFuncs = queryTree->hasWindowFuncs;
+	extendedOpNode->windowClause = queryTree->windowClause;
 
 	return extendedOpNode;
 }
@@ -3575,7 +3409,8 @@ pull_var_clause_default(Node *node)
 	 * PVC_REJECT_PLACEHOLDERS is implicit if PVC_INCLUDE_PLACEHOLDERS
 	 * isn't specified.
 	 */
-	List *columnList = pull_var_clause(node, PVC_RECURSE_AGGREGATES);
+	List *columnList = pull_var_clause(node, PVC_RECURSE_AGGREGATES |
+									   PVC_RECURSE_WINDOWFUNCS);
 
 	return columnList;
 }
@@ -3638,7 +3473,7 @@ JoinRuleApplyFunction(JoinRuleType ruleType)
 
 	if (!ruleApplyFunctionInitialized)
 	{
-		RuleApplyFunctionArray[BROADCAST_JOIN] = &ApplyBroadcastJoin;
+		RuleApplyFunctionArray[REFERENCE_JOIN] = &ApplyReferenceJoin;
 		RuleApplyFunctionArray[LOCAL_PARTITION_JOIN] = &ApplyLocalJoin;
 		RuleApplyFunctionArray[SINGLE_PARTITION_JOIN] = &ApplySinglePartitionJoin;
 		RuleApplyFunctionArray[DUAL_PARTITION_JOIN] = &ApplyDualPartitionJoin;
@@ -3659,12 +3494,12 @@ JoinRuleApplyFunction(JoinRuleType ruleType)
  * right node. The new node uses the broadcast join rule to perform the join.
  */
 static MultiNode *
-ApplyBroadcastJoin(MultiNode *leftNode, MultiNode *rightNode,
+ApplyReferenceJoin(MultiNode *leftNode, MultiNode *rightNode,
 				   Var *partitionColumn, JoinType joinType,
 				   List *applicableJoinClauses)
 {
 	MultiJoin *joinNode = CitusMakeNode(MultiJoin);
-	joinNode->joinRuleType = BROADCAST_JOIN;
+	joinNode->joinRuleType = REFERENCE_JOIN;
 	joinNode->joinType = joinType;
 	joinNode->joinClauseList = applicableJoinClauses;
 
@@ -3947,6 +3782,8 @@ SubqueryPushdownMultiNodeTree(Query *queryTree)
 	havingClauseColumnList = pull_var_clause_default(queryTree->havingQual);
 	columnList = list_concat(targetColumnList, havingClauseColumnList);
 
+	FlattenJoinVars(columnList, queryTree);
+
 	/* create a target entry for each unique column */
 	subqueryTargetEntryList = CreateSubqueryTargetEntryList(columnList);
 
@@ -4011,6 +3848,73 @@ SubqueryPushdownMultiNodeTree(Query *queryTree)
 	currentTopNode = (MultiNode *) extendedOpNode;
 
 	return currentTopNode;
+}
+
+
+/*
+ * FlattenJoinVars iterates over provided columnList to identify
+ * Var's that are referenced from join RTE, and reverts back to their
+ * original RTEs.
+ *
+ * This is required because Postgres allows columns to be referenced using
+ * a join alias. Therefore the same column from a table could be referenced
+ * twice using its absolute table name (t1.a), and without table name (a).
+ * This is a problem when one of them is inside the group by clause and the
+ * other is not. Postgres is smart about it to detect that both target columns
+ * resolve to the same thing, and allows a single group by clause to cover
+ * both target entries when standard planner is called. Since we operate on
+ * the original query, we want to make sure we provide correct varno/varattno
+ * values to Postgres so that it could produce valid query.
+ *
+ * Only exception is that, if a join is given an alias name, we do not want to
+ * flatten those var's. If we do, deparsing fails since it expects to see a join
+ * alias, and cannot access the RTE in the join tree by their names.
+ */
+static void
+FlattenJoinVars(List *columnList, Query *queryTree)
+{
+	ListCell *columnCell = NULL;
+	List *rteList = queryTree->rtable;
+
+	foreach(columnCell, columnList)
+	{
+		Var *column = (Var *) lfirst(columnCell);
+		RangeTblEntry *columnRte = NULL;
+		PlannerInfo *root = NULL;
+
+		Assert(IsA(column, Var));
+
+		/*
+		 * if join does not have an alias, it is copied over join rte.
+		 * There is no need to find the JoinExpr to check whether it has
+		 * an alias defined.
+		 *
+		 * We use the planner's flatten_join_alias_vars routine to do
+		 * the flattening; it wants a PlannerInfo root node, which
+		 * fortunately can be mostly dummy.
+		 */
+		columnRte = rt_fetch(column->varno, rteList);
+		if (columnRte->rtekind == RTE_JOIN && columnRte->alias == NULL)
+		{
+			Var *normalizedVar = NULL;
+
+			if (root == NULL)
+			{
+				root = makeNode(PlannerInfo);
+				root->parse = (queryTree);
+				root->planner_cxt = CurrentMemoryContext;
+				root->hasJoinRTEs = true;
+			}
+
+			normalizedVar = (Var *) flatten_join_alias_vars(root, (Node *) column);
+
+			/*
+			 * We need to copy values over existing one to make sure it is updated on
+			 * respective places.
+			 */
+			memcpy(column, normalizedVar, sizeof(Var));
+		}
+	}
 }
 
 

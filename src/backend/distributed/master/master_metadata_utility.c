@@ -210,10 +210,11 @@ DistributedTableSizeOnWorker(WorkerNode *workerNode, Oid relationId, char *sizeQ
 	char *tableSizeString;
 	uint64 tableSize = 0;
 	MultiConnection *connection = NULL;
-	uint32 connectionFlag = FORCE_NEW_CONNECTION;
+	uint32 connectionFlag = 0;
 	PGresult *result = NULL;
 	int queryResult = 0;
 	List *sizeList = NIL;
+	bool raiseErrors = true;
 
 	List *shardIntervalsOnNode = ShardIntervalsOnWorkerGroup(workerNode, relationId);
 
@@ -234,6 +235,8 @@ DistributedTableSizeOnWorker(WorkerNode *workerNode, Oid relationId, char *sizeQ
 	tableSizeStringInfo = (StringInfo) linitial(sizeList);
 	tableSizeString = tableSizeStringInfo->data;
 	tableSize = atol(tableSizeString);
+
+	ClearResults(connection, raiseErrors);
 
 	return tableSize;
 }
@@ -561,6 +564,7 @@ CopyShardInterval(ShardInterval *srcInterval, ShardInterval *destInterval)
 	destInterval->minValueExists = srcInterval->minValueExists;
 	destInterval->maxValueExists = srcInterval->maxValueExists;
 	destInterval->shardId = srcInterval->shardId;
+	destInterval->shardIndex = srcInterval->shardIndex;
 
 	destInterval->minValue = 0;
 	if (destInterval->minValueExists)
@@ -637,7 +641,7 @@ NodeGroupHasShardPlacements(uint32 groupId, bool onlyConsiderActivePlacements)
 
 	HeapTuple heapTuple = NULL;
 	SysScanDesc scanDescriptor = NULL;
-	ScanKeyData scanKey[scanKeyCount];
+	ScanKeyData scanKey[2];
 
 	Relation pgPlacement = heap_open(DistPlacementRelationId(),
 									 AccessShareLock);
@@ -1097,7 +1101,7 @@ DeleteShardPlacementRow(uint64 placementId)
 	Relation pgDistPlacement = NULL;
 	SysScanDesc scanDescriptor = NULL;
 	const int scanKeyCount = 1;
-	ScanKeyData scanKey[scanKeyCount];
+	ScanKeyData scanKey[1];
 	bool indexOK = true;
 	HeapTuple heapTuple = NULL;
 	TupleDesc tupleDescriptor = NULL;

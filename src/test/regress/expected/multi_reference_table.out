@@ -1013,7 +1013,7 @@ FROM
 	reference_table_test, colocated_table_test
 WHERE 
 	colocated_table_test.value_1 = reference_table_test.value_1;
-LOG:  join order: [ "colocated_table_test" ][ broadcast join "reference_table_test" ]
+LOG:  join order: [ "colocated_table_test" ][ reference join "reference_table_test" ]
  value_1 
 ---------
        1
@@ -1026,7 +1026,7 @@ FROM
 	reference_table_test, colocated_table_test 
 WHERE 
 	colocated_table_test.value_2 = reference_table_test.value_2;
-LOG:  join order: [ "colocated_table_test" ][ broadcast join "reference_table_test" ]
+LOG:  join order: [ "colocated_table_test" ][ reference join "reference_table_test" ]
  value_2 
 ---------
        1
@@ -1039,7 +1039,7 @@ FROM
 	colocated_table_test, reference_table_test
 WHERE 
 	reference_table_test.value_1 = colocated_table_test.value_1;
-LOG:  join order: [ "colocated_table_test" ][ broadcast join "reference_table_test" ]
+LOG:  join order: [ "colocated_table_test" ][ reference join "reference_table_test" ]
  value_2 
 ---------
        1
@@ -1052,7 +1052,7 @@ FROM
 	reference_table_test, colocated_table_test, colocated_table_test_2
 WHERE 
 	colocated_table_test.value_2 = reference_table_test.value_2;
-LOG:  join order: [ "colocated_table_test" ][ broadcast join "reference_table_test" ][ cartesian product "colocated_table_test_2" ]
+LOG:  join order: [ "colocated_table_test" ][ reference join "reference_table_test" ][ cartesian product "colocated_table_test_2" ]
 ERROR:  cannot perform distributed planning on this query
 DETAIL:  Cartesian products are currently unsupported
 SELECT 
@@ -1061,7 +1061,7 @@ FROM
 	reference_table_test, colocated_table_test, colocated_table_test_2
 WHERE 
 	colocated_table_test.value_1 = colocated_table_test_2.value_1 AND colocated_table_test.value_2 = reference_table_test.value_2;
-LOG:  join order: [ "colocated_table_test" ][ broadcast join "reference_table_test" ][ local partition join "colocated_table_test_2" ]
+LOG:  join order: [ "colocated_table_test" ][ reference join "reference_table_test" ][ local partition join "colocated_table_test_2" ]
  value_2 
 ---------
        1
@@ -1075,7 +1075,7 @@ FROM
 	reference_table_test, colocated_table_test, colocated_table_test_2
 WHERE 
 	colocated_table_test.value_2 = colocated_table_test_2.value_2 AND colocated_table_test.value_2 = reference_table_test.value_2;
-LOG:  join order: [ "colocated_table_test" ][ broadcast join "reference_table_test" ][ dual partition join "colocated_table_test_2" ]
+LOG:  join order: [ "colocated_table_test" ][ reference join "reference_table_test" ][ dual partition join "colocated_table_test_2" ]
  value_2 
 ---------
        1
@@ -1088,7 +1088,7 @@ FROM
 	reference_table_test, colocated_table_test, colocated_table_test_2
 WHERE 
 	colocated_table_test.value_1 = reference_table_test.value_1 AND colocated_table_test_2.value_1 = reference_table_test.value_1;
-LOG:  join order: [ "colocated_table_test" ][ broadcast join "reference_table_test" ][ dual partition join "colocated_table_test_2" ]
+LOG:  join order: [ "colocated_table_test" ][ reference join "reference_table_test" ][ dual partition join "colocated_table_test_2" ]
  value_2 
 ---------
        1
@@ -1419,7 +1419,7 @@ SELECT part_storage_type, part_key, part_replica_count, part_max_size,
   FROM master_get_table_metadata('reference_schema.reference_table_ddl');
  part_storage_type | part_key | part_replica_count | part_max_size | part_placement_policy 
 -------------------+----------+--------------------+---------------+-----------------------
- t                 |          |                  2 |        307200 |                     2
+ t                 |          |                  2 |       1536000 |                     2
 (1 row)
 
 SELECT shardid AS a_shard_id  FROM pg_dist_shard WHERE logicalrelid = 'reference_schema.reference_table_ddl'::regclass \gset

@@ -212,63 +212,12 @@ SELECT * FROM articles, position('om' in 'Thomas') ORDER BY 2 DESC, 1 DESC, 3 DE
 SELECT * FROM articles WHERE author_id IN (SELECT id FROM authors WHERE name LIKE '%a');
 ERROR:  Complex subqueries and CTEs are not supported when task_executor_type is set to 'task-tracker'
 -- subqueries are supported in FROM clause
+SET citus.large_table_shard_count TO 1;
 SELECT articles.id,test.word_count
 FROM articles, (SELECT id, word_count FROM articles) AS test WHERE test.id = articles.id
 ORDER BY articles.id;
- id | word_count 
-----+------------
-  1 |       9572
-  2 |      13642
-  3 |      10480
-  4 |      14551
-  5 |      11389
-  6 |      15459
-  7 |      12298
-  8 |      16368
-  9 |        438
- 10 |      17277
- 11 |       1347
- 12 |      18185
- 13 |       2255
- 14 |      19094
- 15 |       3164
- 16 |          2
- 17 |       4073
- 18 |        911
- 19 |       4981
- 20 |       1820
- 21 |       5890
- 22 |       2728
- 23 |       6799
- 24 |       3637
- 25 |       7707
- 26 |       4545
- 27 |       8616
- 28 |       5454
- 29 |       9524
- 30 |       6363
- 31 |       7271
- 32 |      11342
- 33 |       8180
- 34 |      12250
- 35 |       9089
- 36 |      13159
- 37 |       9997
- 38 |      14067
- 39 |      10906
- 40 |      14976
- 41 |      11814
- 42 |      15885
- 43 |      12723
- 44 |      16793
- 45 |        864
- 46 |      17702
- 47 |       1772
- 48 |      18610
- 49 |       2681
- 50 |      19519
-(50 rows)
-
+ERROR:  Complex subqueries and CTEs are not supported when task_executor_type is set to 'task-tracker'
+RESET citus.large_table_shard_count;
 -- subqueries are not supported in SELECT clause
 SELECT a.title AS name, (SELECT a2.id FROM articles_single_shard a2 WHERE a.id = a2.id  LIMIT 1)
 						 AS special_price FROM articles a;
@@ -386,7 +335,7 @@ SELECT o_orderstatus, count(*), avg(o_totalprice) FROM orders
 	ORDER BY o_orderstatus;
  o_orderstatus | count |         avg         
 ---------------+-------+---------------------
- O             |  1460 | 143355.847013698630
+ O             |  1461 | 143326.447029431896
  P             |    75 | 164847.914533333333
 (2 rows)
 
@@ -398,7 +347,7 @@ SELECT o_orderstatus, sum(l_linenumber), avg(l_linenumber) FROM lineitem, orders
  o_orderstatus | sum  |        avg         
 ---------------+------+--------------------
  F             | 8559 | 3.0126715945089757
- O             | 8901 | 3.0050641458474004
+ O             | 8904 | 3.0040485829959514
 (2 rows)
 
 -- now, test the cases where Citus do or do not need to create
@@ -572,21 +521,21 @@ DEBUG:  join prunable for task partitionId 3 and 0
 DEBUG:  join prunable for task partitionId 3 and 1
 DEBUG:  join prunable for task partitionId 3 and 2
 DEBUG:  pruning merge fetch taskId 1
-DETAIL:  Creating dependency on merge taskId 3
+DETAIL:  Creating dependency on merge taskId 2
 DEBUG:  pruning merge fetch taskId 2
-DETAIL:  Creating dependency on merge taskId 5
+DETAIL:  Creating dependency on merge taskId 3
 DEBUG:  pruning merge fetch taskId 4
-DETAIL:  Creating dependency on merge taskId 5
+DETAIL:  Creating dependency on merge taskId 4
 DEBUG:  pruning merge fetch taskId 5
-DETAIL:  Creating dependency on merge taskId 8
+DETAIL:  Creating dependency on merge taskId 6
 DEBUG:  pruning merge fetch taskId 7
-DETAIL:  Creating dependency on merge taskId 7
+DETAIL:  Creating dependency on merge taskId 6
 DEBUG:  pruning merge fetch taskId 8
-DETAIL:  Creating dependency on merge taskId 11
-DEBUG:  pruning merge fetch taskId 10
 DETAIL:  Creating dependency on merge taskId 9
+DEBUG:  pruning merge fetch taskId 10
+DETAIL:  Creating dependency on merge taskId 8
 DEBUG:  pruning merge fetch taskId 11
-DETAIL:  Creating dependency on merge taskId 14
+DETAIL:  Creating dependency on merge taskId 12
 ERROR:  the query contains a join that requires repartitioning
 HINT:  Set citus.enable_repartition_joins to on to enable repartitioning
 -- system columns from shard tables can be queried and retrieved

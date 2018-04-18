@@ -31,7 +31,8 @@ test: multi_read_from_secondaries
 # ----------
 test: multi_create_table
 test: multi_create_table_constraints multi_master_protocol multi_load_data multi_behavioral_analytics_create_table
-test: multi_behavioral_analytics_basics multi_behavioral_analytics_single_shard_queries multi_insert_select_non_pushable_queries multi_insert_select multi_insert_select_window multi_shard_update_delete
+test: multi_behavioral_analytics_basics multi_behavioral_analytics_single_shard_queries multi_insert_select_non_pushable_queries multi_insert_select
+test: multi_insert_select_window multi_shard_update_delete window_functions
 
 # ----------
 # Tests for partitioning support
@@ -43,8 +44,9 @@ test: multi_partitioning_utils multi_partitioning
 # Tests for recursive subquery planning
 # ----------
 test: subquery_basics subquery_local_tables subquery_executors subquery_and_cte set_operations set_operation_and_local_tables
-test: subqueries_deep subquery_view subquery_partitioning subquery_complex_target_list subqueries_not_supported  
-test: subquery_prepared_statements
+test: subqueries_deep subquery_view subquery_partitioning subquery_complex_target_list subqueries_not_supported subquery_in_where 
+test: non_colocated_leaf_subquery_joins non_colocated_subquery_joins non_colocated_join_order
+test: subquery_prepared_statements 
 
 # ----------
 # Miscellaneous tests to check our query planning behavior
@@ -58,7 +60,8 @@ test: multi_subquery_union multi_subquery_in_where_clause multi_subquery_misc
 test: multi_agg_distinct multi_agg_approximate_distinct multi_limit_clause_approximate multi_outer_join_reference multi_single_relation_subquery multi_prepare_plsql
 test: multi_reference_table
 test: multi_average_expression multi_working_columns multi_having_pushdown
-test: multi_array_agg multi_limit_clause
+test: multi_array_agg multi_limit_clause multi_orderby_limit_pushdown
+test: multi_jsonb_agg multi_jsonb_object_agg multi_json_agg multi_json_object_agg bool_agg
 test: multi_agg_type_conversion multi_count_type_conversion
 test: multi_partition_pruning
 test: multi_join_pruning multi_hash_pruning
@@ -156,7 +159,8 @@ test: multi_transaction_recovery
 # multi_copy creates hash and range-partitioned tables and performs COPY
 # multi_router_planner creates hash partitioned tables.
 # ---------
-test: multi_copy multi_router_planner
+test: multi_copy
+test: multi_router_planner
 
 # ----------
 # multi_large_shardid loads more lineitem data using high shard identifiers
@@ -194,11 +198,6 @@ test: multi_function_evaluation
 # multi_truncate tests truncate functionality for distributed tables
 # ----------
 test: multi_truncate
-
-# ----------
-# multi_expire_table_cache tests for broadcast tables
-# ----------
-test: multi_expire_table_cache
 
 # ----------
 # multi_colocation_utils tests utility functions written for co-location feature & internal API

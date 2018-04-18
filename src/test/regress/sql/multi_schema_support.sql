@@ -319,15 +319,16 @@ SELECT * FROM nation_hash;
 
 --test COLLATION with schema
 SET search_path TO public;
-CREATE COLLATION test_schema_support.english FROM "en_US";
+SELECT quote_ident(current_setting('lc_collate')) as current_locale \gset
+CREATE COLLATION test_schema_support.english (LOCALE = :current_locale);
 
 -- create COLLATION in worker node 1 in schema
 \c - - - :worker_1_port
-CREATE COLLATION test_schema_support.english FROM "en_US";
+CREATE COLLATION test_schema_support.english (LOCALE = :current_locale);
 
 -- create COLLATION in worker node 2 in schema
 \c - - - :worker_2_port
-CREATE COLLATION test_schema_support.english FROM "en_US";
+CREATE COLLATION test_schema_support.english (LOCALE = :current_locale);
 
 \c - - - :master_port
 
@@ -558,6 +559,8 @@ SELECT master_apply_delete_command('DELETE FROM nation_append') ;
 -- create necessary objects and load data to them
 CREATE SCHEMA test_schema_support_join_1;
 CREATE SCHEMA test_schema_support_join_2;
+SET citus.shard_count to 4;
+SET citus.shard_replication_factor to 1;
 
 CREATE TABLE test_schema_support_join_1.nation_hash (
     n_nationkey integer not null,
@@ -577,8 +580,7 @@ CREATE TABLE test_schema_support_join_2.nation_hash (
     n_regionkey integer not null,
     n_comment varchar(152));
 
-SELECT master_create_distributed_table('test_schema_support_join_1.nation_hash', 'n_nationkey', 'hash');
-SELECT master_create_worker_shards('test_schema_support_join_1.nation_hash', 4, 1);
+SELECT create_distributed_table('test_schema_support_join_1.nation_hash', 'n_nationkey');
 
 \copy test_schema_support_join_1.nation_hash FROM STDIN with delimiter '|';
 0|ALGERIA|0|haggle. carefully final deposits detect slyly agai
@@ -589,8 +591,7 @@ SELECT master_create_worker_shards('test_schema_support_join_1.nation_hash', 4, 
 5|ETHIOPIA|0|ven packages wake quickly. regu
 \.
 
-SELECT master_create_distributed_table('test_schema_support_join_1.nation_hash_2', 'n_nationkey', 'hash');
-SELECT master_create_worker_shards('test_schema_support_join_1.nation_hash_2', 4, 1);
+SELECT create_distributed_table('test_schema_support_join_1.nation_hash_2', 'n_nationkey');
 
 \copy test_schema_support_join_1.nation_hash_2 FROM STDIN with delimiter '|';
 0|ALGERIA|0|haggle. carefully final deposits detect slyly agai
@@ -601,8 +602,7 @@ SELECT master_create_worker_shards('test_schema_support_join_1.nation_hash_2', 4
 5|ETHIOPIA|0|ven packages wake quickly. regu
 \.
 
-SELECT master_create_distributed_table('test_schema_support_join_2.nation_hash', 'n_nationkey', 'hash');
-SELECT master_create_worker_shards('test_schema_support_join_2.nation_hash', 4, 1);
+SELECT create_distributed_table('test_schema_support_join_2.nation_hash', 'n_nationkey');
 
 \copy test_schema_support_join_2.nation_hash FROM STDIN with delimiter '|';
 0|ALGERIA|0|haggle. carefully final deposits detect slyly agai
@@ -780,5 +780,81 @@ INSERT INTO run_test_schema.test_table VALUES(9);
 SELECT sum(result::int) FROM run_command_on_placements('run_test_schema.test_table','SELECT pg_table_size(''%s'')');
 SELECT sum(result::int) FROM run_command_on_shards('run_test_schema.test_table','SELECT pg_table_size(''%s'')');
 
+-- test capital letters on both table and schema names
+SET citus.task_executor_type to "real-time";
+-- create schema with weird names
+CREATE SCHEMA "CiTuS.TeeN";
+CREATE SCHEMA "CiTUS.TEEN2";
+
+-- create table with weird names
+CREATE TABLE "CiTuS.TeeN"."TeeNTabLE.1!?!"(id int, "TeNANt_Id" int);
+CREATE TABLE "CiTUS.TEEN2"."CAPITAL_TABLE"(i int, j int);
+
+-- create distributed table with weird names
+SELECT create_distributed_table('"CiTuS.TeeN"."TeeNTabLE.1!?!"', 'TeNANt_Id');
+SELECT create_distributed_table('"CiTUS.TEEN2"."CAPITAL_TABLE"', 'i');
+
+-- insert into table with weird names
+INSERT INTO "CiTuS.TeeN"."TeeNTabLE.1!?!" VALUES(1, 1),(1, 0),(0, 1),(2, 3),(3, 2),(4, 4);
+INSERT INTO "CiTUS.TEEN2"."CAPITAL_TABLE" VALUES(0, 1),(1, 0),(2, 1),(4, 3),(3, 2),(4, 4);
+
+-- join on tables with weird names
+SELECT * 
+FROM "CiTuS.TeeN"."TeeNTabLE.1!?!", "CiTUS.TEEN2"."CAPITAL_TABLE" 
+WHERE "CiTUS.TEEN2"."CAPITAL_TABLE".i = "CiTuS.TeeN"."TeeNTabLE.1!?!"."TeNANt_Id"
+ORDER BY 1,2,3,4;
+
+-- add group by, having, order by clauses
+SELECT * 
+FROM "CiTuS.TeeN"."TeeNTabLE.1!?!", "CiTUS.TEEN2"."CAPITAL_TABLE" 
+WHERE "CiTUS.TEEN2"."CAPITAL_TABLE".i = "CiTuS.TeeN"."TeeNTabLE.1!?!"."TeNANt_Id"
+GROUP BY "TeNANt_Id", id, i, j 
+HAVING "TeNANt_Id" > 0 AND j >= id ORDER BY "TeNANt_Id";
+
+SELECT * 
+FROM "CiTuS.TeeN"."TeeNTabLE.1!?!" join "CiTUS.TEEN2"."CAPITAL_TABLE" on
+("CiTUS.TEEN2"."CAPITAL_TABLE".i = "CiTuS.TeeN"."TeeNTabLE.1!?!"."TeNANt_Id")
+GROUP BY "TeNANt_Id", id, i, j 
+HAVING "TeNANt_Id" > 0 AND j >= id
+ORDER BY 1,2,3,4;
+
+-- run with CTEs
+WITH "cTE" AS (
+  SELECT * 
+  FROM "CiTuS.TeeN"."TeeNTabLE.1!?!"
+)
+SELECT * FROM "cTE" join "CiTUS.TEEN2"."CAPITAL_TABLE" on
+("cTE"."TeNANt_Id" = "CiTUS.TEEN2"."CAPITAL_TABLE".i)
+GROUP BY "TeNANt_Id", id, i, j 
+HAVING "TeNANt_Id" > 0 AND j >= id
+ORDER BY 1,2,3,4;
+
+SET search_path to "CiTuS.TeeN";
+-- and subqueries
+SELECT * 
+FROM (
+      SELECT * 
+      FROM "TeeNTabLE.1!?!"
+      ) "cTE"
+join "CiTUS.TEEN2"."CAPITAL_TABLE" on
+("cTE"."TeNANt_Id" = "CiTUS.TEEN2"."CAPITAL_TABLE".i)
+GROUP BY "TeNANt_Id", id, i, j 
+HAVING "TeNANt_Id" > 0 AND j >= id
+ORDER BY 1,2,3,4;
+
+SET search_path to default;
+-- Some DDL
+ALTER TABLE "CiTuS.TeeN"."TeeNTabLE.1!?!" ADD COLUMN "NEW_TeeN:COl" text;
+
+-- Some DML
+DELETE FROM "CiTuS.TeeN"."TeeNTabLE.1!?!" WHERE "TeNANt_Id"=1;
+
+-- Some more DDL
+ALTER TABLE "CiTuS.TeeN"."TeeNTabLE.1!?!" ADD CONSTRAINT "ConsNAmE<>" PRIMARY KEY ("TeNANt_Id");
+
 -- Clean up the created schema
 DROP SCHEMA run_test_schema CASCADE;
+DROP SCHEMA test_schema_support_join_1 CASCADE;
+DROP SCHEMA test_schema_support_join_2 CASCADE;
+DROP SCHEMA "CiTuS.TeeN" CASCADE;
+DROP SCHEMA "CiTUS.TEEN2" CASCADE;

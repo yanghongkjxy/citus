@@ -501,11 +501,10 @@ static void
 UpdateNodeLocation(int32 nodeId, char *newNodeName, int32 newNodePort)
 {
 	const bool indexOK = true;
-	const int scanKeyCount = 1;
 
 	Relation pgDistNode = NULL;
 	TupleDesc tupleDescriptor = NULL;
-	ScanKeyData scanKey[scanKeyCount];
+	ScanKeyData scanKey[1];
 	SysScanDesc scanDescriptor = NULL;
 	HeapTuple heapTuple = NULL;
 	Datum values[Natts_pg_dist_node];
@@ -516,10 +515,10 @@ UpdateNodeLocation(int32 nodeId, char *newNodeName, int32 newNodePort)
 	tupleDescriptor = RelationGetDescr(pgDistNode);
 
 	ScanKeyInit(&scanKey[0], Anum_pg_dist_node_nodeid,
-				BTEqualStrategyNumber, F_INT8EQ, Int32GetDatum(nodeId));
+				BTEqualStrategyNumber, F_INT4EQ, Int32GetDatum(nodeId));
 
 	scanDescriptor = systable_beginscan(pgDistNode, DistNodeNodeIdIndexId(), indexOK,
-										NULL, scanKeyCount, scanKey);
+										NULL, 1, scanKey);
 
 	heapTuple = systable_getnext(scanDescriptor);
 	if (!HeapTupleIsValid(heapTuple))
@@ -630,7 +629,7 @@ get_shard_id_for_distribution_column(PG_FUNCTION_ARGS)
 		List *shardIntervalList = LoadShardIntervalList(relationId);
 		if (shardIntervalList == NIL)
 		{
-			PG_RETURN_INT64(NULL);
+			PG_RETURN_INT64(0);
 		}
 
 		shardInterval = (ShardInterval *) linitial(shardIntervalList);
@@ -679,7 +678,7 @@ get_shard_id_for_distribution_column(PG_FUNCTION_ARGS)
 		PG_RETURN_INT64(shardInterval->shardId);
 	}
 
-	PG_RETURN_INT64(NULL);
+	PG_RETURN_INT64(0);
 }
 
 
@@ -1044,7 +1043,7 @@ GetNodeTuple(char *nodeName, int32 nodePort)
 	const int scanKeyCount = 2;
 	const bool indexOK = false;
 
-	ScanKeyData scanKey[scanKeyCount];
+	ScanKeyData scanKey[2];
 	SysScanDesc scanDescriptor = NULL;
 	HeapTuple heapTuple = NULL;
 	HeapTuple nodeTuple = NULL;
@@ -1052,7 +1051,7 @@ GetNodeTuple(char *nodeName, int32 nodePort)
 	ScanKeyInit(&scanKey[0], Anum_pg_dist_node_nodename,
 				BTEqualStrategyNumber, F_TEXTEQ, CStringGetTextDatum(nodeName));
 	ScanKeyInit(&scanKey[1], Anum_pg_dist_node_nodeport,
-				BTEqualStrategyNumber, F_INT8EQ, Int32GetDatum(nodePort));
+				BTEqualStrategyNumber, F_INT4EQ, Int32GetDatum(nodePort));
 	scanDescriptor = systable_beginscan(pgDistNode, InvalidOid, indexOK,
 										NULL, scanKeyCount, scanKey);
 
@@ -1192,20 +1191,18 @@ GetNextNodeId()
 	Datum sequenceIdDatum = ObjectIdGetDatum(sequenceId);
 	Oid savedUserId = InvalidOid;
 	int savedSecurityContext = 0;
-	Datum nextNodedIdDatum = 0;
+	Datum nextNodeIdDatum;
 	int nextNodeId = 0;
 
 	GetUserIdAndSecContext(&savedUserId, &savedSecurityContext);
 	SetUserIdAndSecContext(CitusExtensionOwner(), SECURITY_LOCAL_USERID_CHANGE);
 
 	/* generate new and unique shardId from sequence */
-	nextNodedIdDatum = DirectFunctionCall1(nextval_oid, sequenceIdDatum);
+	nextNodeIdDatum = DirectFunctionCall1(nextval_oid, sequenceIdDatum);
 
 	SetUserIdAndSecContext(savedUserId, savedSecurityContext);
 
-	PG_RETURN_DATUM(nextNodedIdDatum);
-
-	nextNodeId = DatumGetUInt32(nextNodeId);
+	nextNodeId = DatumGetUInt32(nextNodeIdDatum);
 
 	return nextNodeId;
 }
@@ -1291,14 +1288,14 @@ DeleteNodeRow(char *nodeName, int32 nodePort)
 
 	HeapTuple heapTuple = NULL;
 	SysScanDesc heapScan = NULL;
-	ScanKeyData scanKey[scanKeyCount];
+	ScanKeyData scanKey[2];
 
 	Relation pgDistNode = heap_open(DistNodeRelationId(), RowExclusiveLock);
 
 	ScanKeyInit(&scanKey[0], Anum_pg_dist_node_nodename,
 				BTEqualStrategyNumber, F_TEXTEQ, CStringGetTextDatum(nodeName));
 	ScanKeyInit(&scanKey[1], Anum_pg_dist_node_nodeport,
-				BTEqualStrategyNumber, F_INT8EQ, Int32GetDatum(nodePort));
+				BTEqualStrategyNumber, F_INT4EQ, Int32GetDatum(nodePort));
 
 	heapScan = systable_beginscan(pgDistNode, InvalidOid, indexOK,
 								  NULL, scanKeyCount, scanKey);

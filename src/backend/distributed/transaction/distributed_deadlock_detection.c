@@ -41,7 +41,7 @@ bool LogDistributedDeadlockDetection = false;
 
 
 static bool CheckDeadlockForTransactionNode(TransactionNode *startingTransactionNode,
-											TransactionNode **transactionNodeStack,
+											int maxStackDepth,
 											List **deadlockPath);
 static void PrependOutgoingNodesToQueue(TransactionNode *queuedTransactionNode,
 										int currentStackDepth,
@@ -79,7 +79,7 @@ check_distributed_deadlocks(PG_FUNCTION_ARGS)
 
 
 /*
- * CheckForDistributedDeadlocks is the entry point for detecing
+ * CheckForDistributedDeadlocks is the entry point for detecting
  * distributed deadlocks.
  *
  * In plain words, the function first builds a wait graph by
@@ -134,7 +134,12 @@ CheckForDistributedDeadlocks(void)
 	{
 		bool deadlockFound = false;
 		List *deadlockPath = NIL;
-		TransactionNode *transactionNodeStack[edgeCount + 1];
+
+		/*
+		 * Since we only see nodes which are waiting or being waited upon it's not
+		 * possible to have more than edgeCount + 1 nodes.
+		 */
+		int maxStackDepth = edgeCount + 1;
 
 		/* we're only interested in finding deadlocks originating from this node */
 		if (transactionNode->transactionId.initiatorNodeIdentifier != localGroupId)
@@ -145,7 +150,7 @@ CheckForDistributedDeadlocks(void)
 		ResetVisitedFields(adjacencyLists);
 
 		deadlockFound = CheckDeadlockForTransactionNode(transactionNode,
-														transactionNodeStack,
+														maxStackDepth,
 														&deadlockPath);
 		if (deadlockFound)
 		{
@@ -230,25 +235,28 @@ CheckForDistributedDeadlocks(void)
  */
 static bool
 CheckDeadlockForTransactionNode(TransactionNode *startingTransactionNode,
-								TransactionNode **transactionNodeStack,
+								int maxStackDepth,
 								List **deadlockPath)
 {
 	List *toBeVisitedNodes = NIL;
-	int currentStackDepth = 0;
+	const int rootStackDepth = 0;
+	TransactionNode **transactionNodeStack =
+		palloc0(maxStackDepth * sizeof(TransactionNode *));
 
 	/*
 	 * We keep transactionNodeStack to keep track of the deadlock paths. At this point,
 	 * adjust the depth of the starting node and set the stack's first element with
 	 * the starting node.
 	 */
-	transactionNodeStack[currentStackDepth] = startingTransactionNode;
+	transactionNodeStack[rootStackDepth] = startingTransactionNode;
 
-	PrependOutgoingNodesToQueue(startingTransactionNode, currentStackDepth,
+	PrependOutgoingNodesToQueue(startingTransactionNode, rootStackDepth,
 								&toBeVisitedNodes);
 
 	/* traverse the graph and search for the deadlocks */
 	while (toBeVisitedNodes != NIL)
 	{
+		int currentStackDepth;
 		QueuedTransactionNode *queuedTransactionNode =
 			(QueuedTransactionNode *) linitial(toBeVisitedNodes);
 		TransactionNode *currentTransactionNode = queuedTransactionNode->transactionNode;
@@ -261,6 +269,7 @@ CheckDeadlockForTransactionNode(TransactionNode *startingTransactionNode,
 			BuildDeadlockPathList(queuedTransactionNode, transactionNodeStack,
 								  deadlockPath);
 
+			pfree(transactionNodeStack);
 			return true;
 		}
 
@@ -274,12 +283,14 @@ CheckDeadlockForTransactionNode(TransactionNode *startingTransactionNode,
 
 		/* set the stack's corresponding element with the current node */
 		currentStackDepth = queuedTransactionNode->currentStackDepth;
+		Assert(currentStackDepth < maxStackDepth);
 		transactionNodeStack[currentStackDepth] = currentTransactionNode;
 
 		PrependOutgoingNodesToQueue(currentTransactionNode, currentStackDepth,
 									&toBeVisitedNodes);
 	}
 
+	pfree(transactionNodeStack);
 	return false;
 }
 

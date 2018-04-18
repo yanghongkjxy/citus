@@ -29,6 +29,7 @@ SET
 WHERE 
 	shardid IN (SELECT shardid FROM pg_dist_shard WHERE logicalrelid = 'orders_subquery'::regclass ORDER BY shardid DESC LIMIT 1);
 
+SET client_min_messages TO DEBUG1;
 -- If group by is not on partition column then we recursively plan
 SELECT
 	avg(order_count)
@@ -41,7 +42,7 @@ FROM
 	GROUP BY
 		l_suppkey) AS order_counts;
 
--- Check that we error out if join is not on partition columns.
+-- Check that we recursively plan if join is not on partition columns.
 SELECT
 	avg(unit_price)
 FROM
@@ -54,19 +55,7 @@ FROM
 	GROUP BY
 		l_orderkey) AS unit_prices;
 
-SELECT
-	avg(unit_price)
-FROM
-	(SELECT
-		l_orderkey,
-		avg(o_totalprice / l_quantity) AS unit_price
-	FROM
-		lineitem_subquery,
-		orders_subquery
-	WHERE
-		l_orderkey = o_custkey
-	GROUP BY
-		l_orderkey) AS unit_prices;
+RESET client_min_messages;
 
 -- Subqueries without relation with a volatile functions (non-constant) are planned recursively
 SELECT count(*) FROM (

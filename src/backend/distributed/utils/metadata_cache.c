@@ -121,6 +121,7 @@ typedef struct MetadataCacheData
 	Oid readIntermediateResultFuncId;
 	Oid extraDataContainerFuncId;
 	Oid workerHashFunctionId;
+	Oid textSendAsJsonbFunctionId;
 	Oid extensionOwner;
 	Oid binaryCopyFormatId;
 	Oid textCopyFormatId;
@@ -145,6 +146,8 @@ static HTAB *DistShardCacheHash = NULL;
 
 /* Hash table for informations about worker nodes */
 static HTAB *WorkerNodeHash = NULL;
+static WorkerNode **WorkerNodeArray = NULL;
+static int WorkerNodeCount = 0;
 static bool workerNodeHashValid = false;
 
 /* default value is -1, for coordinator it's 0 and for worker nodes > 0 */
@@ -167,6 +170,7 @@ static ShardInterval ** SortShardIntervalArray(ShardInterval **shardIntervalArra
 											   shardIntervalSortCompareFunction);
 static bool HasUniformHashDistribution(ShardInterval **shardIntervalArray,
 									   int shardIntervalArrayLength);
+static void PrepareWorkerNodeCache(void);
 static bool HasUninitializedShardInterval(ShardInterval **sortedShardIntervalArray,
 										  int shardCount);
 static bool CheckInstalledVersion(int elevel);
@@ -273,7 +277,7 @@ IsDistributedTableViaCatalog(Oid relationId)
 	HeapTuple partitionTuple = NULL;
 	SysScanDesc scanDescriptor = NULL;
 	const int scanKeyCount = 1;
-	ScanKeyData scanKey[scanKeyCount];
+	ScanKeyData scanKey[1];
 	bool indexOK = true;
 
 	Relation pgDistPartition = heap_open(DistPartitionRelationId(), AccessShareLock);
@@ -510,15 +514,14 @@ ResolveGroupShardPlacement(GroupShardPlacement *groupShardPlacement,
 static WorkerNode *
 LookupNodeForGroup(uint32 groupId)
 {
-	WorkerNode *workerNode = NULL;
-	HASH_SEQ_STATUS status;
-	HTAB *workerNodeHash = GetWorkerNodeHash();
 	bool foundAnyNodes = false;
+	int workerNodeIndex = 0;
 
-	hash_seq_init(&status, workerNodeHash);
+	PrepareWorkerNodeCache();
 
-	while ((workerNode = hash_seq_search(&status)) != NULL)
+	for (workerNodeIndex = 0; workerNodeIndex < WorkerNodeCount; workerNodeIndex++)
 	{
+		WorkerNode *workerNode = WorkerNodeArray[workerNodeIndex];
 		uint32 workerNodeGroupId = workerNode->groupId;
 		if (workerNodeGroupId != groupId)
 		{
@@ -529,7 +532,6 @@ LookupNodeForGroup(uint32 groupId)
 
 		if (WorkerNodeIsReadable(workerNode))
 		{
-			hash_seq_term(&status);
 			return workerNode;
 		}
 	}
@@ -1126,6 +1128,9 @@ BuildCachedShardList(DistTableCacheEntry *cacheEntry)
 
 		cacheEntry->arrayOfPlacementArrays[shardIndex] = placementArray;
 		cacheEntry->arrayOfPlacementArrayLengths[shardIndex] = numberOfPlacements;
+
+		/* store the shard index in the ShardInterval */
+		shardInterval->shardIndex = shardIndex;
 	}
 
 	cacheEntry->shardIntervalArrayLength = shardIntervalArrayLength;
@@ -1941,6 +1946,24 @@ CitusWorkerHashFunctionId(void)
 }
 
 
+/* return oid of the citus_text_send_as_jsonb(text) function */
+Oid
+CitusTextSendAsJsonbFunctionId(void)
+{
+	if (MetadataCache.textSendAsJsonbFunctionId == InvalidOid)
+	{
+		List *nameList = list_make2(makeString("pg_catalog"),
+									makeString("citus_text_send_as_jsonb"));
+		Oid paramOids[1] = { TEXTOID };
+
+		MetadataCache.textSendAsJsonbFunctionId =
+			LookupFuncName(nameList, 1, paramOids, false);
+	}
+
+	return MetadataCache.textSendAsJsonbFunctionId;
+}
+
+
 /*
  * CitusExtensionOwner() returns the owner of the 'citus' extension. That user
  * is, amongst others, used to perform actions a normal user might not be
@@ -2444,12 +2467,27 @@ InitializeDistTableCache(void)
 
 
 /*
- * GetWorkerNodeHash is a wrapper around InitializeWorkerNodeCache(). It
- * triggers InitializeWorkerNodeCache when the workerHash is invalid. Otherwise,
- * it returns the hash.
+ * GetWorkerNodeHash returns the worker node data as a hash with the nodename and
+ * nodeport as a key.
+ *
+ * The hash is returned from the cache, if the cache is not (yet) valid, it is first
+ * rebuilt.
  */
 HTAB *
 GetWorkerNodeHash(void)
+{
+	PrepareWorkerNodeCache();
+
+	return WorkerNodeHash;
+}
+
+
+/*
+ * PrepareWorkerNodeCache makes sure the worker node data from pg_dist_node is cached,
+ * if it is not already cached.
+ */
+static void
+PrepareWorkerNodeCache(void)
 {
 	InitializeCaches(); /* ensure relevant callbacks are registered */
 
@@ -2471,8 +2509,6 @@ GetWorkerNodeHash(void)
 
 		workerNodeHashValid = true;
 	}
-
-	return WorkerNodeHash;
 }
 
 
@@ -2484,13 +2520,16 @@ GetWorkerNodeHash(void)
 static void
 InitializeWorkerNodeCache(void)
 {
-	HTAB *oldWorkerNodeHash = NULL;
+	HTAB *newWorkerNodeHash = NULL;
 	List *workerNodeList = NIL;
 	ListCell *workerNodeCell = NULL;
 	HASHCTL info;
 	int hashFlags = 0;
 	long maxTableSize = (long) MaxWorkerNodesTracked;
 	bool includeNodesFromOtherClusters = false;
+	int newWorkerNodeCount = 0;
+	WorkerNode **newWorkerNodeArray = NULL;
+	int workerNodeIndex = 0;
 
 	InitializeCaches();
 
@@ -2507,13 +2546,14 @@ InitializeWorkerNodeCache(void)
 	info.match = WorkerNodeCompare;
 	hashFlags = HASH_ELEM | HASH_FUNCTION | HASH_CONTEXT | HASH_COMPARE;
 
-	oldWorkerNodeHash = WorkerNodeHash;
-	WorkerNodeHash = hash_create("Worker Node Hash",
-								 maxTableSize,
-								 &info, hashFlags);
+	newWorkerNodeHash = hash_create("Worker Node Hash", maxTableSize, &info, hashFlags);
 
 	/* read the list from pg_dist_node */
 	workerNodeList = ReadWorkerNodes(includeNodesFromOtherClusters);
+
+	newWorkerNodeCount = list_length(workerNodeList);
+	newWorkerNodeArray = MemoryContextAlloc(CacheMemoryContext,
+											sizeof(WorkerNode *) * newWorkerNodeCount);
 
 	/* iterate over the worker node list */
 	foreach(workerNodeCell, workerNodeList)
@@ -2525,7 +2565,7 @@ InitializeWorkerNodeCache(void)
 
 		/* search for the worker node in the hash, and then insert the values */
 		hashKey = (void *) currentNode;
-		workerNode = (WorkerNode *) hash_search(WorkerNodeHash, hashKey,
+		workerNode = (WorkerNode *) hash_search(newWorkerNodeHash, hashKey,
 												HASH_ENTER, &handleFound);
 
 		/* fill the newly allocated workerNode in the cache */
@@ -2539,6 +2579,8 @@ InitializeWorkerNodeCache(void)
 		workerNode->nodeRole = currentNode->nodeRole;
 		strlcpy(workerNode->nodeCluster, currentNode->nodeCluster, NAMEDATALEN);
 
+		newWorkerNodeArray[workerNodeIndex++] = workerNode;
+
 		if (handleFound)
 		{
 			ereport(WARNING, (errmsg("multiple lines for worker node: \"%s:%u\"",
@@ -2551,7 +2593,16 @@ InitializeWorkerNodeCache(void)
 	}
 
 	/* now, safe to destroy the old hash */
-	hash_destroy(oldWorkerNodeHash);
+	hash_destroy(WorkerNodeHash);
+
+	if (WorkerNodeArray != NULL)
+	{
+		pfree(WorkerNodeArray);
+	}
+
+	WorkerNodeCount = newWorkerNodeCount;
+	WorkerNodeArray = newWorkerNodeArray;
+	WorkerNodeHash = newWorkerNodeHash;
 }
 
 

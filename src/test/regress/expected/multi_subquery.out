@@ -17,8 +17,11 @@ FROM
 		l_orderkey = o_orderkey
 	GROUP BY
 		l_orderkey) AS unit_prices;
-ERROR:  cannot push down this subquery
-DETAIL:  Shards of relations in subquery need to have 1-to-1 shard partitioning
+           avg           
+-------------------------
+ 142158.8766934673366834
+(1 row)
+
 -- Update metadata in order to make all shards equal
 -- note that the table is created on multi_insert_select_create_table.sql
 UPDATE 
@@ -27,6 +30,7 @@ SET
 	shardmaxvalue = '14947' 
 WHERE 
 	shardid IN (SELECT shardid FROM pg_dist_shard WHERE logicalrelid = 'orders_subquery'::regclass ORDER BY shardid DESC LIMIT 1);
+SET client_min_messages TO DEBUG1;
 -- If group by is not on partition column then we recursively plan
 SELECT
 	avg(order_count)
@@ -38,12 +42,14 @@ FROM
 		lineitem_subquery
 	GROUP BY
 		l_suppkey) AS order_counts;
+DEBUG:  generating subplan 2_1 for subquery SELECT l_suppkey, count(*) AS order_count FROM public.lineitem_subquery GROUP BY l_suppkey
+DEBUG:  Plan 2 query after replacing subqueries and CTEs: SELECT avg(order_count) AS avg FROM (SELECT intermediate_result.l_suppkey, intermediate_result.order_count FROM read_intermediate_result('2_1'::text, 'binary'::citus_copy_format) intermediate_result(l_suppkey integer, order_count bigint)) order_counts
         avg         
 --------------------
  1.7199369356456930
 (1 row)
 
--- Check that we error out if join is not on partition columns.
+-- Check that we recursively plan if join is not on partition columns.
 SELECT
 	avg(unit_price)
 FROM
@@ -55,21 +61,9 @@ FROM
 		orders_subquery
 	GROUP BY
 		l_orderkey) AS unit_prices;
-ERROR:  complex joins are only supported when all distributed tables are joined on their distribution columns with equal operator
-SELECT
-	avg(unit_price)
-FROM
-	(SELECT
-		l_orderkey,
-		avg(o_totalprice / l_quantity) AS unit_price
-	FROM
-		lineitem_subquery,
-		orders_subquery
-	WHERE
-		l_orderkey = o_custkey
-	GROUP BY
-		l_orderkey) AS unit_prices;
-ERROR:  complex joins are only supported when all distributed tables are joined on their distribution columns with equal operator
+ERROR:  cannot perform distributed planning on this query
+DETAIL:  Cartesian products are currently unsupported
+RESET client_min_messages;
 -- Subqueries without relation with a volatile functions (non-constant) are planned recursively
 SELECT count(*) FROM (
    SELECT l_orderkey FROM lineitem_subquery JOIN (SELECT random()::int r) sub ON (l_orderkey = r) WHERE r > 10
@@ -280,6 +274,8 @@ ORDER BY l_orderkey DESC
 LIMIT 10;
  l_orderkey 
 ------------
+      14947
+      14947
       14946
       14946
       14945
@@ -288,8 +284,6 @@ LIMIT 10;
       14945
       14945
       14945
-      14944
-      14944
 (10 rows)
 
 -- non-implicit typecast is not supported in equi-join
@@ -681,7 +675,7 @@ WHERE
 	unit_price < 10000;
           avg          
 -----------------------
- 4968.2889885208475549
+ 4968.4946466804019323
 (1 row)
 
 -- Check that if subquery is pulled, we don't error and run query properly.
@@ -818,9 +812,6 @@ SET client_min_messages TO DEBUG2;
 SELECT * FROM
 	(SELECT count(*) FROM subquery_pruning_varchar_test_table WHERE a = 'onder' GROUP BY a)
 AS foo;
-DEBUG:  Skipping the target shard interval 570033 because SELECT query is pruned away for the interval
-DEBUG:  Skipping the target shard interval 570034 because SELECT query is pruned away for the interval
-DEBUG:  Skipping the target shard interval 570036 because SELECT query is pruned away for the interval
  count 
 -------
 (0 rows)
@@ -828,9 +819,6 @@ DEBUG:  Skipping the target shard interval 570036 because SELECT query is pruned
 SELECT * FROM
 	(SELECT count(*) FROM subquery_pruning_varchar_test_table WHERE 'eren' = a GROUP BY a)
 AS foo;
-DEBUG:  Skipping the target shard interval 570033 because SELECT query is pruned away for the interval
-DEBUG:  Skipping the target shard interval 570035 because SELECT query is pruned away for the interval
-DEBUG:  Skipping the target shard interval 570036 because SELECT query is pruned away for the interval
  count 
 -------
 (0 rows)

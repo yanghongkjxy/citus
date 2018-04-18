@@ -13,6 +13,7 @@
 
 #include "postgres.h"
 
+#include "distributed/multi_logical_optimizer.h"
 #include "distributed/multi_master_planner.h"
 #include "distributed/multi_physical_planner.h"
 #include "distributed/distributed_planner.h"
@@ -21,6 +22,7 @@
 #include "nodes/makefuncs.h"
 #include "nodes/nodeFuncs.h"
 #include "optimizer/clauses.h"
+#include "optimizer/cost.h"
 #include "optimizer/planmain.h"
 #include "optimizer/tlist.h"
 #include "optimizer/var.h"
@@ -36,6 +38,7 @@ static PlannedStmt * BuildSelectStatement(Query *masterQuery, List *masterTarget
 static Agg * BuildAggregatePlan(Query *masterQuery, Plan *subPlan);
 static bool HasDistinctAggregate(Query *masterQuery);
 static Plan * BuildDistinctPlan(Query *masterQuery, Plan *subPlan);
+static List * PrepareTargetListForNextPlan(List *targetList);
 
 
 /*
@@ -78,9 +81,17 @@ MasterTargetList(List *workerTargetList)
 	foreach(workerTargetCell, workerTargetList)
 	{
 		TargetEntry *workerTargetEntry = (TargetEntry *) lfirst(workerTargetCell);
-		TargetEntry *masterTargetEntry = copyObject(workerTargetEntry);
+		TargetEntry *masterTargetEntry = NULL;
+		Var *masterColumn = NULL;
 
-		Var *masterColumn = makeVarFromTargetEntry(tableId, workerTargetEntry);
+		if (workerTargetEntry->resjunk)
+		{
+			continue;
+		}
+
+		masterTargetEntry = copyObject(workerTargetEntry);
+
+		masterColumn = makeVarFromTargetEntry(tableId, workerTargetEntry);
 		masterColumn->varattno = columnId;
 		masterColumn->varoattno = columnId;
 		columnId++;
@@ -289,7 +300,7 @@ BuildAggregatePlan(Query *masterQuery, Plan *subPlan)
 	if (groupColumnCount > 0)
 	{
 		bool groupingIsHashable = grouping_is_hashable(groupColumnList);
-		bool groupingIsSortable = grouping_is_hashable(groupColumnList);
+		bool groupingIsSortable = grouping_is_sortable(groupColumnList);
 		bool hasDistinctAggregate = HasDistinctAggregate(masterQuery);
 
 		if (!groupingIsHashable && !groupingIsSortable)
@@ -303,13 +314,20 @@ BuildAggregatePlan(Query *masterQuery, Plan *subPlan)
 		 * see nodeAgg.c:build_pertrans_for_aggref(). In that case we use
 		 * sorted agg strategy, otherwise we use hash strategy.
 		 */
-		if (!groupingIsHashable || hasDistinctAggregate)
+		if (!enable_hashagg || !groupingIsHashable || hasDistinctAggregate)
 		{
+			char *messageHint = NULL;
+			if (!enable_hashagg && groupingIsHashable)
+			{
+				messageHint = "Consider setting enable_hashagg to on.";
+			}
+
 			if (!groupingIsSortable)
 			{
 				ereport(ERROR, (errmsg("grouped column list must cannot be sorted"),
 								errdetail("Having a distinct aggregate requires "
-										  "grouped column list to be sortable.")));
+										  "grouped column list to be sortable."),
+								messageHint ? errhint("%s", messageHint) : 0));
 			}
 
 			aggregateStrategy = AGG_SORTED;
@@ -389,27 +407,28 @@ BuildDistinctPlan(Query *masterQuery, Plan *subPlan)
 	bool distinctClausesHashable = true;
 	List *distinctClauseList = masterQuery->distinctClause;
 	List *targetList = copyObject(masterQuery->targetList);
-	List *columnList = pull_var_clause_default((Node *) targetList);
-	ListCell *columnCell = NULL;
 	bool hasDistinctAggregate = false;
 
-	if (IsA(subPlan, Agg))
+	/*
+	 * We don't need to add distinct plan if all of the columns used in group by
+	 * clause also used in distinct clause, since group by clause guarantees the
+	 * uniqueness of the target list for every row.
+	 */
+	if (IsGroupBySubsetOfDistinct(masterQuery->groupClause, masterQuery->distinctClause))
 	{
 		return subPlan;
 	}
 
+	/*
+	 * We need to adjust varno to OUTER_VAR, since planner expects that for upper
+	 * level plans above the sequential scan. We also need to convert aggregations
+	 * (if exists) to regular Vars since the aggregation would be applied by the
+	 * previous aggregation plan and we don't want them to be applied again.
+	 */
+	targetList = PrepareTargetListForNextPlan(targetList);
+
 	Assert(masterQuery->distinctClause);
 	Assert(!masterQuery->hasDistinctOn);
-
-	/*
-	 * For upper level plans above the sequential scan, the planner expects the
-	 * table id (varno) to be set to OUTER_VAR.
-	 */
-	foreach(columnCell, columnList)
-	{
-		Var *column = (Var *) lfirst(columnCell);
-		column->varno = OUTER_VAR;
-	}
 
 	/*
 	 * Create group by plan with HashAggregate if all distinct
@@ -418,7 +437,8 @@ BuildDistinctPlan(Query *masterQuery, Plan *subPlan)
 	 */
 	distinctClausesHashable = grouping_is_hashable(distinctClauseList);
 	hasDistinctAggregate = HasDistinctAggregate(masterQuery);
-	if (distinctClausesHashable && !hasDistinctAggregate)
+
+	if (enable_hashagg && distinctClausesHashable && !hasDistinctAggregate)
 	{
 		const long rowEstimate = 10;  /* using the same value as BuildAggregatePlan() */
 		AttrNumber *distinctColumnIdArray = extract_grouping_cols(distinctClauseList,
@@ -441,4 +461,36 @@ BuildDistinctPlan(Query *masterQuery, Plan *subPlan)
 	}
 
 	return distinctPlan;
+}
+
+
+/*
+ * PrepareTargetListForNextPlan handles both regular columns to have right varno
+ * and convert aggregates to regular Vars in the target list.
+ */
+static List *
+PrepareTargetListForNextPlan(List *targetList)
+{
+	List *newtargetList = NIL;
+	ListCell *targetEntryCell = NULL;
+
+	foreach(targetEntryCell, targetList)
+	{
+		TargetEntry *targetEntry = lfirst(targetEntryCell);
+		TargetEntry *newTargetEntry = NULL;
+		Var *newVar = NULL;
+
+		Assert(IsA(targetEntry, TargetEntry));
+
+		/*
+		 * For upper level plans above the sequential scan, the planner expects the
+		 * table id (varno) to be set to OUTER_VAR.
+		 */
+		newVar = makeVarFromTargetEntry(OUTER_VAR, targetEntry);
+		newTargetEntry = flatCopyTargetEntry(targetEntry);
+		newTargetEntry->expr = (Expr *) newVar;
+		newtargetList = lappend(newtargetList, newTargetEntry);
+	}
+
+	return newtargetList;
 }

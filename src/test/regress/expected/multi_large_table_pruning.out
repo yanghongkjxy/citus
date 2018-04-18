@@ -13,7 +13,7 @@ EXPLAIN (COSTS OFF)
 SELECT
 	count(*)
 FROM
-	orders, customer
+	orders, customer_append
 WHERE
 	o_custkey = c_custkey;
 DEBUG:  join prunable for intervals [1,1000] and [1001,2000]
@@ -23,11 +23,11 @@ DEBUG:  join prunable for intervals [1001,2000] and [6001,7000]
 DEBUG:  join prunable for intervals [6001,7000] and [1,1000]
 DEBUG:  join prunable for intervals [6001,7000] and [1001,2000]
 DEBUG:  pruning merge fetch taskId 1
-DETAIL:  Creating dependency on merge taskId 5
-DEBUG:  pruning merge fetch taskId 4
-DETAIL:  Creating dependency on merge taskId 8
-DEBUG:  pruning merge fetch taskId 7
-DETAIL:  Creating dependency on merge taskId 11
+DETAIL:  Creating dependency on merge taskId 3
+DEBUG:  pruning merge fetch taskId 3
+DETAIL:  Creating dependency on merge taskId 6
+DEBUG:  pruning merge fetch taskId 5
+DETAIL:  Creating dependency on merge taskId 9
                             QUERY PLAN                             
 -------------------------------------------------------------------
  Aggregate
@@ -42,7 +42,7 @@ DETAIL:  Creating dependency on merge taskId 11
 SELECT
 	count(*)
 FROM
-	orders, customer
+	orders, customer_append
 WHERE
 	o_custkey = c_custkey;
 DEBUG:  join prunable for intervals [1,1000] and [1001,2000]
@@ -52,14 +52,14 @@ DEBUG:  join prunable for intervals [1001,2000] and [6001,7000]
 DEBUG:  join prunable for intervals [6001,7000] and [1,1000]
 DEBUG:  join prunable for intervals [6001,7000] and [1001,2000]
 DEBUG:  pruning merge fetch taskId 1
-DETAIL:  Creating dependency on merge taskId 5
-DEBUG:  pruning merge fetch taskId 4
-DETAIL:  Creating dependency on merge taskId 8
-DEBUG:  pruning merge fetch taskId 7
-DETAIL:  Creating dependency on merge taskId 11
+DETAIL:  Creating dependency on merge taskId 3
+DEBUG:  pruning merge fetch taskId 3
+DETAIL:  Creating dependency on merge taskId 6
+DEBUG:  pruning merge fetch taskId 5
+DETAIL:  Creating dependency on merge taskId 9
  count 
 -------
-  2984
+  2985
 (1 row)
 
 -- Single range-repartition join with a selection clause on the partitioned
@@ -68,7 +68,7 @@ EXPLAIN (COSTS OFF)
 SELECT
 	count(*)
 FROM
-	orders, customer
+	orders, customer_append
 WHERE
 	o_custkey = c_custkey AND
 	o_orderkey < 0;
@@ -86,7 +86,7 @@ WHERE
 SELECT
 	count(*)
 FROM
-	orders, customer
+	orders, customer_append
 WHERE
 	o_custkey = c_custkey AND
 	o_orderkey < 0;
@@ -101,7 +101,7 @@ EXPLAIN (COSTS OFF)
 SELECT
 	count(*)
 FROM
-	orders, customer
+	orders, customer_append
 WHERE
 	o_custkey = c_custkey AND
 	c_custkey < 0;
@@ -119,7 +119,7 @@ WHERE
 SELECT
 	count(*)
 FROM
-	orders, customer
+	orders, customer_append
 WHERE
 	o_custkey = c_custkey AND
 	c_custkey < 0;
@@ -135,7 +135,7 @@ EXPLAIN (COSTS OFF)
 SELECT
 	count(*)
 FROM
-	lineitem, customer
+	lineitem, customer_append
 WHERE
 	l_partkey = c_nationkey;
 DEBUG:  join prunable for task partitionId 0 and 1
@@ -151,21 +151,21 @@ DEBUG:  join prunable for task partitionId 3 and 0
 DEBUG:  join prunable for task partitionId 3 and 1
 DEBUG:  join prunable for task partitionId 3 and 2
 DEBUG:  pruning merge fetch taskId 1
-DETAIL:  Creating dependency on merge taskId 17
+DETAIL:  Creating dependency on merge taskId 3
 DEBUG:  pruning merge fetch taskId 2
-DETAIL:  Creating dependency on merge taskId 7
+DETAIL:  Creating dependency on merge taskId 4
 DEBUG:  pruning merge fetch taskId 4
-DETAIL:  Creating dependency on merge taskId 26
+DETAIL:  Creating dependency on merge taskId 6
 DEBUG:  pruning merge fetch taskId 5
-DETAIL:  Creating dependency on merge taskId 11
+DETAIL:  Creating dependency on merge taskId 8
 DEBUG:  pruning merge fetch taskId 7
-DETAIL:  Creating dependency on merge taskId 35
+DETAIL:  Creating dependency on merge taskId 9
 DEBUG:  pruning merge fetch taskId 8
-DETAIL:  Creating dependency on merge taskId 15
+DETAIL:  Creating dependency on merge taskId 12
 DEBUG:  pruning merge fetch taskId 10
-DETAIL:  Creating dependency on merge taskId 44
+DETAIL:  Creating dependency on merge taskId 12
 DEBUG:  pruning merge fetch taskId 11
-DETAIL:  Creating dependency on merge taskId 19
+DETAIL:  Creating dependency on merge taskId 16
                             QUERY PLAN                             
 -------------------------------------------------------------------
  Aggregate
@@ -173,7 +173,7 @@ DETAIL:  Creating dependency on merge taskId 19
          Task Count: 4
          Tasks Shown: None, not supported for re-partition queries
          ->  MapMergeJob
-               Map Task Count: 8
+               Map Task Count: 2
                Merge Task Count: 4
          ->  MapMergeJob
                Map Task Count: 3
@@ -183,7 +183,7 @@ DETAIL:  Creating dependency on merge taskId 19
 SELECT
 	count(*)
 FROM
-	lineitem, customer
+	lineitem, customer_append
 WHERE
 	l_partkey = c_nationkey;
 DEBUG:  join prunable for task partitionId 0 and 1
@@ -199,21 +199,21 @@ DEBUG:  join prunable for task partitionId 3 and 0
 DEBUG:  join prunable for task partitionId 3 and 1
 DEBUG:  join prunable for task partitionId 3 and 2
 DEBUG:  pruning merge fetch taskId 1
-DETAIL:  Creating dependency on merge taskId 17
+DETAIL:  Creating dependency on merge taskId 3
 DEBUG:  pruning merge fetch taskId 2
-DETAIL:  Creating dependency on merge taskId 7
+DETAIL:  Creating dependency on merge taskId 4
 DEBUG:  pruning merge fetch taskId 4
-DETAIL:  Creating dependency on merge taskId 26
+DETAIL:  Creating dependency on merge taskId 6
 DEBUG:  pruning merge fetch taskId 5
-DETAIL:  Creating dependency on merge taskId 11
+DETAIL:  Creating dependency on merge taskId 8
 DEBUG:  pruning merge fetch taskId 7
-DETAIL:  Creating dependency on merge taskId 35
+DETAIL:  Creating dependency on merge taskId 9
 DEBUG:  pruning merge fetch taskId 8
-DETAIL:  Creating dependency on merge taskId 15
+DETAIL:  Creating dependency on merge taskId 12
 DEBUG:  pruning merge fetch taskId 10
-DETAIL:  Creating dependency on merge taskId 44
+DETAIL:  Creating dependency on merge taskId 12
 DEBUG:  pruning merge fetch taskId 11
-DETAIL:  Creating dependency on merge taskId 19
+DETAIL:  Creating dependency on merge taskId 16
  count 
 -------
    125
@@ -225,7 +225,7 @@ EXPLAIN (COSTS OFF)
 SELECT
 	count(*)
 FROM
-	lineitem, customer
+	lineitem, customer_append
 WHERE
 	l_partkey = c_nationkey AND
 	l_orderkey < 0;
@@ -246,7 +246,7 @@ WHERE
 SELECT
 	count(*)
 FROM
-	lineitem, customer
+	lineitem, customer_append
 WHERE
 	l_partkey = c_nationkey AND
 	l_orderkey < 0;
@@ -260,7 +260,7 @@ EXPLAIN (COSTS OFF)
 SELECT
 	o_orderkey
 FROM
-	orders INNER JOIN customer ON (o_custkey = c_custkey)
+	orders INNER JOIN customer_append ON (o_custkey = c_custkey)
 WHERE
 	false;
                          QUERY PLAN                          
@@ -277,7 +277,7 @@ WHERE
 SELECT
 	o_orderkey
 FROM
-	orders INNER JOIN customer ON (o_custkey = c_custkey)
+	orders INNER JOIN customer_append ON (o_custkey = c_custkey)
 WHERE
 	false;
  o_orderkey 
@@ -288,7 +288,7 @@ EXPLAIN (COSTS OFF)
 SELECT
 	o_orderkey
 FROM
-	orders INNER JOIN customer ON (o_custkey = c_custkey)
+	orders INNER JOIN customer_append ON (o_custkey = c_custkey)
 WHERE
 	1=0 AND c_custkey < 0;
                          QUERY PLAN                          
@@ -305,7 +305,7 @@ EXPLAIN (COSTS OFF)
 SELECT
 	o_orderkey
 FROM
-	orders INNER JOIN customer ON (o_custkey = c_custkey AND false);
+	orders INNER JOIN customer_append ON (o_custkey = c_custkey AND false);
             QUERY PLAN            
 ----------------------------------
  Custom Scan (Citus Task-Tracker)
@@ -317,7 +317,7 @@ EXPLAIN (COSTS OFF)
 SELECT
 	o_orderkey
 FROM
-	orders, customer
+	orders, customer_append
 WHERE
 	o_custkey = c_custkey AND false;
             QUERY PLAN            

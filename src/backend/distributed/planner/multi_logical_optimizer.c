@@ -155,6 +155,10 @@ static Const * MakeIntegerConstInt64(int64 integerValue);
 /* Local functions forward declarations for aggregate expression checks */
 static void ErrorIfContainsUnsupportedAggregate(MultiNode *logicalPlanNode);
 static void ErrorIfUnsupportedArrayAggregate(Aggref *arrayAggregateExpression);
+static void ErrorIfUnsupportedJsonAggregate(AggregateType type,
+											Aggref *aggregateExpression);
+static void ErrorIfUnsupportedJsonObjectAggregate(AggregateType type,
+												  Aggref *aggregateExpression);
 static void ErrorIfUnsupportedAggregateDistinct(Aggref *aggregateExpression,
 												MultiNode *logicalPlanNode);
 static Var * AggregateDistinctColumn(Aggref *aggregateExpression);
@@ -168,6 +172,10 @@ static Node * WorkerLimitCount(MultiExtendedOp *originalOpNode,
 							   bool groupedByDisjointPartitionColumn);
 static List * WorkerSortClauseList(MultiExtendedOp *originalOpNode,
 								   bool groupedByDisjointPartitionColumn);
+static List * GenerateNewTargetEntriesForSortClauses(List *originalTargetList,
+													 List *sortClauseList,
+													 AttrNumber *targetProjectionNumber,
+													 Index *nextSortGroupRefIndex);
 static bool CanPushDownLimitApproximate(List *sortClauseList, List *targetList);
 static bool HasOrderByAggregate(List *sortClauseList, List *targetList);
 static bool HasOrderByAverage(List *sortClauseList, List *targetList);
@@ -1288,7 +1296,13 @@ MasterExtendedOpNode(MultiExtendedOp *originalOpNode,
 		Expr *newExpression = NULL;
 
 		bool hasAggregates = contain_agg_clause((Node *) originalExpression);
-		if (hasAggregates)
+		bool hasWindowFunction = contain_window_function((Node *) originalExpression);
+
+		/*
+		 * if the aggregate belongs to a window function, it is not mutated, but pushed
+		 * down to worker as it is. Master query should treat that as a Var.
+		 */
+		if (hasAggregates && !hasWindowFunction)
 		{
 			Node *newNode = MasterAggregateMutator((Node *) originalExpression,
 												   walkerContext);
@@ -1585,41 +1599,71 @@ MasterAggregateExpression(Aggref *originalAggregate,
 
 		newMasterExpression = (Expr *) coalesceExpr;
 	}
-	else if (aggregateType == AGGREGATE_ARRAY_AGG)
+	else if (aggregateType == AGGREGATE_ARRAY_AGG ||
+			 aggregateType == AGGREGATE_JSONB_AGG ||
+			 aggregateType == AGGREGATE_JSONB_OBJECT_AGG ||
+			 aggregateType == AGGREGATE_JSON_AGG ||
+			 aggregateType == AGGREGATE_JSON_OBJECT_AGG)
 	{
 		/*
-		 * Array aggregates are handled in two steps. First, we compute array_agg()
-		 * on the worker nodes. Then, we gather the arrays on the master and
-		 * compute the array_cat_agg() aggregate on them to get the final array.
+		 * Array and json aggregates are handled in two steps. First, we compute
+		 * array_agg() or json aggregate on the worker nodes. Then, we gather
+		 * the arrays or jsons on the master and compute the array_cat_agg()
+		 * or jsonb_cat_agg() aggregate on them to get the final array or json.
 		 */
 		Var *column = NULL;
-		TargetEntry *arrayCatAggArgument = NULL;
+		TargetEntry *catAggArgument = NULL;
 		Aggref *newMasterAggregate = NULL;
 		Oid aggregateFunctionId = InvalidOid;
+		const char *catAggregateName = NULL;
+		Oid catInputType = InvalidOid;
 
 		/* worker aggregate and original aggregate have same return type */
 		Oid workerReturnType = exprType((Node *) originalAggregate);
 		int32 workerReturnTypeMod = exprTypmod((Node *) originalAggregate);
 		Oid workerCollationId = exprCollation((Node *) originalAggregate);
 
-		/* assert that we do not support array_agg() with distinct or order by */
+		/* assert that we do not support array or json aggregation with
+		 * distinct or order by */
 		Assert(!originalAggregate->aggorder);
 		Assert(!originalAggregate->aggdistinct);
 
-		/* array_cat_agg() takes anyarray as input */
-		aggregateFunctionId = AggregateFunctionOid(ARRAY_CAT_AGGREGATE_NAME,
-												   ANYARRAYOID);
+		if (aggregateType == AGGREGATE_ARRAY_AGG)
+		{
+			/* array_cat_agg() takes anyarray as input */
+			catAggregateName = ARRAY_CAT_AGGREGATE_NAME;
+			catInputType = ANYARRAYOID;
+		}
+		else if (aggregateType == AGGREGATE_JSONB_AGG ||
+				 aggregateType == AGGREGATE_JSONB_OBJECT_AGG)
+		{
+			/* jsonb_cat_agg() takes jsonb as input */
+			catAggregateName = JSONB_CAT_AGGREGATE_NAME;
+			catInputType = JSONBOID;
+		}
+		else
+		{
+			/* json_cat_agg() takes json as input */
+			catAggregateName = JSON_CAT_AGGREGATE_NAME;
+			catInputType = JSONOID;
+		}
 
-		/* create argument for the array_cat_agg() aggregate */
+		Assert(catAggregateName != NULL);
+		Assert(catInputType != InvalidOid);
+
+		aggregateFunctionId = AggregateFunctionOid(catAggregateName,
+												   catInputType);
+
+		/* create argument for the array_cat_agg() or jsonb_cat_agg() aggregate */
 		column = makeVar(masterTableId, walkerContext->columnId, workerReturnType,
 						 workerReturnTypeMod, workerCollationId, columnLevelsUp);
-		arrayCatAggArgument = makeTargetEntry((Expr *) column, argumentId, NULL, false);
+		catAggArgument = makeTargetEntry((Expr *) column, argumentId, NULL, false);
 		walkerContext->columnId++;
 
-		/* construct the master array_cat_agg() expression */
+		/* construct the master array_cat_agg() or jsonb_cat_agg() expression */
 		newMasterAggregate = copyObject(originalAggregate);
 		newMasterAggregate->aggfnoid = aggregateFunctionId;
-		newMasterAggregate->args = list_make1(arrayCatAggArgument);
+		newMasterAggregate->args = list_make1(catAggArgument);
 		newMasterAggregate->aggfilter = NULL;
 		newMasterAggregate->aggtranstype = InvalidOid;
 		newMasterAggregate->aggargtypes = list_make1_oid(ANYARRAYOID);
@@ -1816,9 +1860,14 @@ WorkerExtendedOpNode(MultiExtendedOp *originalOpNode,
 		palloc0(sizeof(WorkerAggregateWalkerContext));
 	Index nextSortGroupRefIndex = 0;
 	bool queryHasAggregates = false;
-	bool enableLimitPushdown = true;
+	bool distinctClauseSupersetofGroupClause = false;
+	bool distinctPreventsLimitPushdown = false;
+	bool createdNewGroupByClause = false;
 	bool hasNonPartitionColumnDistinctAgg = false;
 	bool repartitionSubquery = false;
+
+	/* only window functions that can be pushed down reach here */
+	bool pushDownWindowFunction = originalOpNode->hasWindowFuncs;
 
 	walkerContext->expressionList = NIL;
 
@@ -1855,12 +1904,18 @@ WorkerExtendedOpNode(MultiExtendedOp *originalOpNode,
 		List *newExpressionList = NIL;
 		ListCell *newExpressionCell = NULL;
 		bool hasAggregates = contain_agg_clause((Node *) originalExpression);
+		bool hasWindowFunction = contain_window_function((Node *) originalExpression);
 
 		/* reset walker context */
 		walkerContext->expressionList = NIL;
 		walkerContext->createGroupByClause = false;
 
-		if (hasAggregates)
+		/*
+		 * If the expression uses aggregates inside window function contain agg
+		 * clause still returns true. We want to make sure it is not a part of
+		 * window function before we proceed.
+		 */
+		if (hasAggregates && !hasWindowFunction)
 		{
 			WorkerAggregateWalker((Node *) originalExpression, walkerContext);
 
@@ -1896,11 +1951,7 @@ WorkerExtendedOpNode(MultiExtendedOp *originalOpNode,
 				groupClauseList = lappend(groupClauseList, groupByClause);
 				nextSortGroupRefIndex++;
 
-				/*
-				 * If we introduce new columns accompanied by a new group by clause,
-				 * than pushing down limits will cause incorrect results.
-				 */
-				enableLimitPushdown = false;
+				createdNewGroupByClause = true;
 			}
 
 			if (newTargetEntry->resname == NULL)
@@ -1960,11 +2011,7 @@ WorkerExtendedOpNode(MultiExtendedOp *originalOpNode,
 				groupClauseList = lappend(groupClauseList, groupByClause);
 				nextSortGroupRefIndex++;
 
-				/*
-				 * If we introduce new columns accompanied by a new group by clause,
-				 * than pushing down limits will cause incorrect results.
-				 */
-				enableLimitPushdown = false;
+				createdNewGroupByClause = true;
 			}
 
 			newTargetEntryList = lappend(newTargetEntryList, newTargetEntry);
@@ -1973,34 +2020,132 @@ WorkerExtendedOpNode(MultiExtendedOp *originalOpNode,
 	}
 
 	workerExtendedOpNode = CitusMakeNode(MultiExtendedOp);
-	workerExtendedOpNode->targetList = newTargetEntryList;
 	workerExtendedOpNode->distinctClause = NIL;
 	workerExtendedOpNode->hasDistinctOn = false;
-
-	if (!queryHasAggregates)
-	{
-		workerExtendedOpNode->distinctClause = originalOpNode->distinctClause;
-		workerExtendedOpNode->hasDistinctOn = originalOpNode->hasDistinctOn;
-	}
-
+	workerExtendedOpNode->hasWindowFuncs = originalOpNode->hasWindowFuncs;
+	workerExtendedOpNode->windowClause = originalOpNode->windowClause;
 	workerExtendedOpNode->groupClauseList = groupClauseList;
 
-	if (enableLimitPushdown)
+	if (originalOpNode->distinctClause)
 	{
+		bool shouldPushdownDistinct = false;
+		if (groupClauseList == NIL ||
+			IsGroupBySubsetOfDistinct(groupClauseList,
+									  originalOpNode->distinctClause))
+		{
+			distinctClauseSupersetofGroupClause = true;
+		}
+		else
+		{
+			distinctClauseSupersetofGroupClause = false;
+
+			/*
+			 * GROUP BY being a subset of DISTINCT guarantees the
+			 * distinctness on the workers. Otherwise, pushing down
+			 * LIMIT might cause missing the necessary data from
+			 * the worker query
+			 */
+			distinctPreventsLimitPushdown = true;
+		}
+
+		/*
+		 * Distinct is pushed down to worker query only if the query does not
+		 * contain an aggregate in which master processing might be required to
+		 * complete the final result before distinct operation. We also prevent
+		 * distinct pushdown if distinct clause is missing some entries that
+		 * group by clause has.
+		 */
+		shouldPushdownDistinct = !queryHasAggregates &&
+								 distinctClauseSupersetofGroupClause;
+		if (shouldPushdownDistinct)
+		{
+			workerExtendedOpNode->distinctClause = originalOpNode->distinctClause;
+			workerExtendedOpNode->hasDistinctOn = originalOpNode->hasDistinctOn;
+		}
+	}
+
+	/*
+	 * Order by and limit clauses are pushed down only if
+	 * (1) We do not create a new group by clause during aggregate mutation, and
+	 * (2) There distinct clause does not prevent limit pushdown
+	 */
+	if (!createdNewGroupByClause && !distinctPreventsLimitPushdown)
+	{
+		List *newTargetEntryListForSortClauses = NIL;
+
 		/* if we can push down the limit, also set related fields */
 		workerExtendedOpNode->limitCount = WorkerLimitCount(originalOpNode,
 															groupedByDisjointPartitionColumn);
 		workerExtendedOpNode->sortClauseList =
 			WorkerSortClauseList(originalOpNode, groupedByDisjointPartitionColumn);
+
+		newTargetEntryListForSortClauses =
+			GenerateNewTargetEntriesForSortClauses(originalOpNode->targetList,
+												   workerExtendedOpNode->sortClauseList,
+												   &targetProjectionNumber,
+												   &nextSortGroupRefIndex);
+
+		newTargetEntryList = list_concat(newTargetEntryList,
+										 newTargetEntryListForSortClauses);
 	}
+
+	if (workerExtendedOpNode->windowClause)
+	{
+		List *windowClauseList = workerExtendedOpNode->windowClause;
+		ListCell *windowClauseCell = NULL;
+
+		foreach(windowClauseCell, windowClauseList)
+		{
+			WindowClause *windowClause = (WindowClause *) lfirst(windowClauseCell);
+
+			List *partitionClauseTargetList =
+				GenerateNewTargetEntriesForSortClauses(originalOpNode->targetList,
+													   windowClause->partitionClause,
+													   &targetProjectionNumber,
+													   &nextSortGroupRefIndex);
+			List *orderClauseTargetList =
+				GenerateNewTargetEntriesForSortClauses(originalOpNode->targetList,
+													   windowClause->orderClause,
+													   &targetProjectionNumber,
+													   &nextSortGroupRefIndex);
+
+			newTargetEntryList = list_concat(newTargetEntryList,
+											 partitionClauseTargetList);
+			newTargetEntryList = list_concat(newTargetEntryList,
+											 orderClauseTargetList);
+		}
+	}
+
+	workerExtendedOpNode->targetList = newTargetEntryList;
 
 	/*
 	 * If grouped by a partition column whose values are shards have disjoint sets
 	 * of partition values, we can push down the having qualifier.
+	 *
+	 * When a query with subquery is provided, we can't determine if
+	 * groupedByDisjointPartitionColumn, therefore we also check if there is a
+	 * window function too. If there is a window function we would know that it
+	 * is safe to push down (i.e. it is partitioned on distribution column, and
+	 * if there is a group by, it contains distribution column).
+	 *
 	 */
-	if (havingQual != NULL && groupedByDisjointPartitionColumn)
+	if (havingQual != NULL &&
+		(groupedByDisjointPartitionColumn || pushDownWindowFunction))
 	{
 		workerExtendedOpNode->havingQual = originalOpNode->havingQual;
+
+		/*
+		 * We converted the having expression to a list in subquery pushdown
+		 * planner. However, this query cannot be parsed as it is in the worker.
+		 * We should convert this back to being explicit for worker query
+		 * so that it can be parsed when it hits to the standard planner in
+		 * worker.
+		 */
+		if (IsA(workerExtendedOpNode->havingQual, List))
+		{
+			workerExtendedOpNode->havingQual =
+				(Node *) make_ands_explicit((List *) workerExtendedOpNode->havingQual);
+		}
 	}
 
 	return workerExtendedOpNode;
@@ -2017,7 +2162,10 @@ HasNonPartitionColumnDistinctAgg(List *targetEntryList, Node *havingQual,
 								 List *tableNodeList)
 {
 	List *targetVarList = pull_var_clause((Node *) targetEntryList,
-										  PVC_INCLUDE_AGGREGATES);
+										  PVC_INCLUDE_AGGREGATES |
+										  PVC_RECURSE_WINDOWFUNCS);
+
+	/* having clause can't have window functions, no need to recurse for that */
 	List *havingVarList = pull_var_clause((Node *) havingQual, PVC_INCLUDE_AGGREGATES);
 	List *aggregateCheckList = list_concat(targetVarList, havingVarList);
 
@@ -2301,8 +2449,7 @@ WorkerAggregateExpressionList(Aggref *originalAggregate,
 	else
 	{
 		/*
-		 * All other aggregates are sent as they are to the worker nodes. These
-		 * aggregate functions include sum, count, min, max, and array_agg.
+		 * All other aggregates are sent as they are to the worker nodes.
 		 */
 		Aggref *workerAggregate = copyObject(originalAggregate);
 		workerAggregateList = lappend(workerAggregateList, workerAggregate);
@@ -2367,7 +2514,7 @@ AggregateArgumentType(Aggref *aggregate)
 	TargetEntry *argument = (TargetEntry *) linitial(argumentList);
 	Oid returnTypeId = exprType((Node *) argument->expr);
 
-	/* We currently support aggregates with only one argument; assert that. */
+	/* Here we currently support aggregates with only one argument; assert that. */
 	Assert(list_length(argumentList) == 1);
 
 	return returnTypeId;
@@ -2673,7 +2820,8 @@ ErrorIfContainsUnsupportedAggregate(MultiNode *logicalPlanNode)
 	 * PVC_REJECT_PLACEHOLDERS is implicit if PVC_INCLUDE_PLACEHOLDERS isn't
 	 * specified.
 	 */
-	List *expressionList = pull_var_clause((Node *) targetList, PVC_INCLUDE_AGGREGATES);
+	List *expressionList = pull_var_clause((Node *) targetList, PVC_INCLUDE_AGGREGATES |
+										   PVC_INCLUDE_WINDOWFUNCS);
 
 	ListCell *expressionCell = NULL;
 	foreach(expressionCell, expressionList)
@@ -2701,6 +2849,16 @@ ErrorIfContainsUnsupportedAggregate(MultiNode *logicalPlanNode)
 		if (aggregateType == AGGREGATE_ARRAY_AGG)
 		{
 			ErrorIfUnsupportedArrayAggregate(aggregateExpression);
+		}
+		else if (aggregateType == AGGREGATE_JSONB_AGG ||
+				 aggregateType == AGGREGATE_JSON_AGG)
+		{
+			ErrorIfUnsupportedJsonAggregate(aggregateType, aggregateExpression);
+		}
+		else if (aggregateType == AGGREGATE_JSONB_OBJECT_AGG ||
+				 aggregateType == AGGREGATE_JSON_OBJECT_AGG)
+		{
+			ErrorIfUnsupportedJsonObjectAggregate(aggregateType, aggregateExpression);
 		}
 		else if (aggregateExpression->aggdistinct)
 		{
@@ -2730,6 +2888,60 @@ ErrorIfUnsupportedArrayAggregate(Aggref *arrayAggregateExpression)
 	{
 		ereport(ERROR, (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
 						errmsg("array_agg (distinct) is unsupported")));
+	}
+}
+
+
+/*
+ * ErrorIfUnsupportedJsonAggregate checks if we can transform the json
+ * aggregate expression and push it down to the worker node. If we cannot
+ * transform the aggregate, this function errors.
+ */
+static void
+ErrorIfUnsupportedJsonAggregate(AggregateType type,
+								Aggref *aggregateExpression)
+{
+	/* if json aggregate has order by, we error out */
+	if (aggregateExpression->aggorder)
+	{
+		const char *name = AggregateNames[type];
+		ereport(ERROR, (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+						errmsg("%s with order by is unsupported", name)));
+	}
+
+	/* if json aggregate has distinct, we error out */
+	if (aggregateExpression->aggdistinct)
+	{
+		const char *name = AggregateNames[type];
+		ereport(ERROR, (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+						errmsg("%s (distinct) is unsupported", name)));
+	}
+}
+
+
+/*
+ * ErrorIfUnsupportedJsonObjectAggregate checks if we can transform the
+ * json object aggregate expression and push it down to the worker node.
+ * If we cannot transform the aggregate, this function errors.
+ */
+static void
+ErrorIfUnsupportedJsonObjectAggregate(AggregateType type,
+									  Aggref *aggregateExpression)
+{
+	/* if json object aggregate has order by, we error out */
+	if (aggregateExpression->aggorder)
+	{
+		const char *name = AggregateNames[type];
+		ereport(ERROR, (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+						errmsg("%s with order by is unsupported", name)));
+	}
+
+	/* if json object aggregate has distinct, we error out */
+	if (aggregateExpression->aggdistinct)
+	{
+		const char *name = AggregateNames[type];
+		ereport(ERROR, (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+						errmsg("%s (distinct) is unsupported", name)));
 	}
 }
 
@@ -2888,6 +3100,8 @@ ErrorIfUnsupportedAggregateDistinct(Aggref *aggregateExpression,
  * AggregateDistinctColumn checks if the given aggregate expression's distinct
  * clause is on a single column. If it is, the function finds and returns that
  * column. Otherwise, the function returns null.
+ * The function expects to find a single column here, no FieldSelect or other
+ * expressions are accepted as a column.
  */
 static Var *
 AggregateDistinctColumn(Aggref *aggregateExpression)
@@ -2941,7 +3155,8 @@ TablePartitioningSupportsDistinct(List *tableNodeList, MultiExtendedOp *opNode,
 		char partitionMethod = 0;
 		List *shardList = NIL;
 
-		if (relationId == SUBQUERY_RELATION_ID)
+		if (relationId == SUBQUERY_RELATION_ID ||
+			relationId == SUBQUERY_PUSHDOWN_RELATION_ID)
 		{
 			return true;
 		}
@@ -3394,7 +3609,7 @@ WorkerSortClauseList(MultiExtendedOp *originalOpNode,
 {
 	List *workerSortClauseList = NIL;
 	List *groupClauseList = originalOpNode->groupClauseList;
-	List *sortClauseList = originalOpNode->sortClauseList;
+	List *sortClauseList = copyObject(originalOpNode->sortClauseList);
 	List *targetList = originalOpNode->targetList;
 
 	/* if no limit node and no hasDistinctOn, no need to push down sort clauses */
@@ -3413,7 +3628,7 @@ WorkerSortClauseList(MultiExtendedOp *originalOpNode,
 	 */
 	if (groupClauseList == NIL || groupedByDisjointPartitionColumn)
 	{
-		workerSortClauseList = originalOpNode->sortClauseList;
+		workerSortClauseList = sortClauseList;
 	}
 	else if (sortClauseList != NIL)
 	{
@@ -3422,16 +3637,98 @@ WorkerSortClauseList(MultiExtendedOp *originalOpNode,
 
 		if (orderByNonAggregates)
 		{
-			workerSortClauseList = list_copy(sortClauseList);
+			workerSortClauseList = sortClauseList;
 			workerSortClauseList = list_concat(workerSortClauseList, groupClauseList);
 		}
 		else if (canApproximate)
 		{
-			workerSortClauseList = originalOpNode->sortClauseList;
+			workerSortClauseList = sortClauseList;
 		}
 	}
 
 	return workerSortClauseList;
+}
+
+
+/*
+ * GenerateNewTargetEntriesForSortClauses goes over provided sort clause lists and
+ * creates new target entries if needed to make sure sort clauses has correct
+ * references. The function returns list of new target entries, caller is
+ * responsible to add those target entries to the end of worker target list.
+ *
+ * The function is required because we change the target entry if it contains an
+ * expression having an aggregate operation, or just the AVG aggregate.
+ * Afterwards any order by clause referring to original target entry starts
+ * to point to a wrong expression.
+ *
+ * Note the function modifies SortGroupClause items in sortClauseList,
+ * targetProjectionNumber, and nextSortGroupRefIndex.
+ */
+static List *
+GenerateNewTargetEntriesForSortClauses(List *originalTargetList,
+									   List *sortClauseList,
+									   AttrNumber *targetProjectionNumber,
+									   Index *nextSortGroupRefIndex)
+{
+	List *createdTargetList = NIL;
+	ListCell *sortClauseCell = NULL;
+
+	foreach(sortClauseCell, sortClauseList)
+	{
+		SortGroupClause *sgClause = (SortGroupClause *) lfirst(sortClauseCell);
+		TargetEntry *targetEntry = get_sortgroupclause_tle(sgClause, originalTargetList);
+		Expr *targetExpr = targetEntry->expr;
+		bool containsAggregate = contain_agg_clause((Node *) targetExpr);
+		bool createNewTargetEntry = false;
+
+		/* we are only interested in target entries containing aggregates */
+		if (!containsAggregate)
+		{
+			continue;
+		}
+
+		/*
+		 * If the target expression is not an Aggref, it is either an expression
+		 * on a single aggregate, or expression containing multiple aggregates.
+		 * Worker query mutates these target entries to have a naked target entry
+		 * per aggregate function. We want to use original target entries if this
+		 * the case.
+		 * If the original target expression is an avg aggref, we also want to use
+		 * original target entry.
+		 */
+		if (!IsA(targetExpr, Aggref))
+		{
+			createNewTargetEntry = true;
+		}
+		else
+		{
+			Aggref *aggNode = (Aggref *) targetExpr;
+			AggregateType aggregateType = GetAggregateType(aggNode->aggfnoid);
+			if (aggregateType == AGGREGATE_AVERAGE)
+			{
+				createNewTargetEntry = true;
+			}
+		}
+
+		if (createNewTargetEntry)
+		{
+			bool resJunk = true;
+			AttrNumber nextResNo = (*targetProjectionNumber);
+			Expr *newExpr = copyObject(targetExpr);
+			TargetEntry *newTargetEntry = makeTargetEntry(newExpr, nextResNo,
+														  targetEntry->resname, resJunk);
+			newTargetEntry->ressortgroupref = *nextSortGroupRefIndex;
+
+			createdTargetList = lappend(createdTargetList, newTargetEntry);
+
+			sgClause->tleSortGroupRef = *nextSortGroupRefIndex;
+
+			(*nextSortGroupRefIndex)++;
+			(*targetProjectionNumber)++;
+		}
+	}
+
+	return createdTargetList;
 }
 
 
@@ -3603,4 +3900,51 @@ HasOrderByHllType(List *sortClauseList, List *targetList)
 	}
 
 	return hasOrderByHllType;
+}
+
+
+/*
+ * IsGroupBySubsetOfDistinct checks whether each clause in group clauses also
+ * exists in the distinct clauses. Note that, empty group clause is not a subset
+ * of distinct clause.
+ */
+bool
+IsGroupBySubsetOfDistinct(List *groupClause, List *distinctClause)
+{
+	ListCell *distinctCell = NULL;
+	ListCell *groupCell = NULL;
+
+	/* There must be a group clause */
+	if (list_length(groupClause) == 0)
+	{
+		return false;
+	}
+
+	foreach(groupCell, groupClause)
+	{
+		SortGroupClause *groupClause = (SortGroupClause *) lfirst(groupCell);
+		bool isFound = false;
+
+		foreach(distinctCell, distinctClause)
+		{
+			SortGroupClause *distinctClause = (SortGroupClause *) lfirst(distinctCell);
+
+			if (groupClause->tleSortGroupRef == distinctClause->tleSortGroupRef)
+			{
+				isFound = true;
+				break;
+			}
+		}
+
+		/*
+		 * If we can't find any member of group clause in the distinct clause,
+		 * that means group clause is not a subset of distinct clause.
+		 */
+		if (!isFound)
+		{
+			return false;
+		}
+	}
+
+	return true;
 }

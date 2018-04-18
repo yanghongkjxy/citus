@@ -236,11 +236,21 @@ WITH RECURSIVE hierarchy as (
 				ce.company_id = 2))
 SELECT * FROM hierarchy WHERE LEVEL <= 2;
 
--- CTE with queries other than SELECT is not supported
+-- Test router modifying CTEs
 WITH new_article AS (
-    INSERT INTO articles_hash VALUES (1,  1, 'arsenous', 9572) RETURNING *
+    INSERT INTO articles_hash VALUES (1,  1, 'arsenous', 9) RETURNING *
 )
 SELECT * FROM new_article;
+
+WITH update_article AS (
+    UPDATE articles_hash SET word_count = 10 WHERE id = 1 AND word_count = 9 RETURNING *
+)
+SELECT * FROM update_article;
+
+WITH delete_article AS (
+    DELETE FROM articles_hash WHERE id = 1 AND word_count = 10 RETURNING *
+)
+SELECT * FROM delete_article;
 
 -- Modifying statement in nested CTE case is covered by PostgreSQL itself
 WITH new_article AS (
@@ -291,7 +301,7 @@ ORDER BY articles_hash.id;
 -- subqueries are supported in FROM clause but they are not router plannable
 SELECT articles_hash.id,test.word_count
 FROM articles_hash, (SELECT id, word_count FROM articles_hash) AS test WHERE test.id = articles_hash.id
-ORDER BY articles_hash.id;
+ORDER BY test.word_count DESC, articles_hash.id LIMIT 5;
 
 
 SELECT articles_hash.id,test.word_count
@@ -778,13 +788,18 @@ SELECT * FROM articles_range ar join authors_range au on (ar.author_id = au.id)
 SELECT * FROM articles_range ar join authors_range au on (ar.author_id = au.id)
 	WHERE ar.author_id = 1 and au.id = 2;
 
--- multi-shard join is not router plannable
-SELECT * FROM articles_range ar join authors_range au on (ar.author_id = au.id)
+-- This query was intended to test "multi-shard join is not router plannable"
+-- To run it using repartition join logic we change the join columns
+SET citus.task_executor_type to "task-tracker";
+SELECT * FROM articles_range ar join authors_range au on (ar.title = au.name)
 	WHERE ar.author_id = 35;
 
--- this is a bug, it is a single shard join query but not router plannable
-SELECT * FROM articles_range ar join authors_range au on (ar.author_id = au.id) 
+-- This query was intended to test "this is a bug, it is a single shard join
+-- query but not router plannable". To run it using repartition join logic we
+-- change the join columns.
+SELECT * FROM articles_range ar join authors_range au on (ar.title = au.name) 
 	WHERE ar.author_id = 1 or au.id = 5;
+RESET citus.task_executor_type;
 
 -- bogus query, join on non-partition column, but router plannable due to filters
 SELECT * FROM articles_range ar join authors_range au on (ar.id = au.id) 
@@ -911,7 +926,8 @@ SELECT
 	FROM
 		articles_hash
  	GROUP BY
-		author_id;
+		author_id
+	ORDER BY c;
 
 -- queries inside transactions can be router plannable
 BEGIN;

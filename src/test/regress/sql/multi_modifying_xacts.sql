@@ -111,7 +111,7 @@ INSERT INTO researchers VALUES (8, 5, 'Douglas Engelbart');
 INSERT INTO labs VALUES (5, 'Los Alamos');
 COMMIT;
 
-SELECT * FROM researchers, labs WHERE labs.id = researchers.lab_id;
+SELECT * FROM researchers, labs WHERE labs.id = researchers.lab_id AND researchers.lab_id = 5;
 
 -- and the other way around is also allowed
 BEGIN;
@@ -699,6 +699,10 @@ DROP TRIGGER reject_bad_reference ON reference_modifying_xacts_1200006;
 -- now create a hash distributed table and run tests
 -- including both the reference table and the hash
 -- distributed table
+
+-- To prevent colocating a hash table with append table
+DELETE FROM pg_dist_colocation WHERE colocationid = 100001;
+
 SET citus.next_shard_id TO 1200007;
 SET citus.shard_count = 4;
 SET citus.shard_replication_factor = 1;

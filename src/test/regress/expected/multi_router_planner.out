@@ -428,13 +428,55 @@ WITH RECURSIVE hierarchy as (
 				ce.company_id = 2))
 SELECT * FROM hierarchy WHERE LEVEL <= 2;
 ERROR:  recursive CTEs are not supported in distributed queries
--- CTE with queries other than SELECT is not supported
+-- Test router modifying CTEs
 WITH new_article AS (
-    INSERT INTO articles_hash VALUES (1,  1, 'arsenous', 9572) RETURNING *
+    INSERT INTO articles_hash VALUES (1,  1, 'arsenous', 9) RETURNING *
 )
 SELECT * FROM new_article;
 DEBUG:  data-modifying statements are not supported in the WITH clauses of distributed queries
-ERROR:  data-modifying statements are not supported in the WITH clauses of distributed queries
+DEBUG:  generating subplan 81_1 for CTE new_article: INSERT INTO public.articles_hash (id, author_id, title, word_count) VALUES (1, 1, 'arsenous'::character varying, 9) RETURNING id, author_id, title, word_count
+DEBUG:  Creating router plan
+DEBUG:  Plan is router executable
+DEBUG:  Plan 81 query after replacing subqueries and CTEs: SELECT id, author_id, title, word_count FROM (SELECT intermediate_result.id, intermediate_result.author_id, intermediate_result.title, intermediate_result.word_count FROM read_intermediate_result('81_1'::text, 'binary'::citus_copy_format) intermediate_result(id bigint, author_id bigint, title character varying(20), word_count integer)) new_article
+DEBUG:  Creating router plan
+DEBUG:  Plan is router executable
+ id | author_id |  title   | word_count 
+----+-----------+----------+------------
+  1 |         1 | arsenous |          9
+(1 row)
+
+WITH update_article AS (
+    UPDATE articles_hash SET word_count = 10 WHERE id = 1 AND word_count = 9 RETURNING *
+)
+SELECT * FROM update_article;
+DEBUG:  data-modifying statements are not supported in the WITH clauses of distributed queries
+DEBUG:  generating subplan 83_1 for CTE update_article: UPDATE public.articles_hash SET word_count = 10 WHERE ((id = 1) AND (word_count = 9)) RETURNING id, author_id, title, word_count
+DEBUG:  Creating router plan
+DEBUG:  Plan is router executable
+DEBUG:  Plan 83 query after replacing subqueries and CTEs: SELECT id, author_id, title, word_count FROM (SELECT intermediate_result.id, intermediate_result.author_id, intermediate_result.title, intermediate_result.word_count FROM read_intermediate_result('83_1'::text, 'binary'::citus_copy_format) intermediate_result(id bigint, author_id bigint, title character varying(20), word_count integer)) update_article
+DEBUG:  Creating router plan
+DEBUG:  Plan is router executable
+ id | author_id |  title   | word_count 
+----+-----------+----------+------------
+  1 |         1 | arsenous |         10
+(1 row)
+
+WITH delete_article AS (
+    DELETE FROM articles_hash WHERE id = 1 AND word_count = 10 RETURNING *
+)
+SELECT * FROM delete_article;
+DEBUG:  data-modifying statements are not supported in the WITH clauses of distributed queries
+DEBUG:  generating subplan 85_1 for CTE delete_article: DELETE FROM public.articles_hash WHERE ((id = 1) AND (word_count = 10)) RETURNING id, author_id, title, word_count
+DEBUG:  Creating router plan
+DEBUG:  Plan is router executable
+DEBUG:  Plan 85 query after replacing subqueries and CTEs: SELECT id, author_id, title, word_count FROM (SELECT intermediate_result.id, intermediate_result.author_id, intermediate_result.title, intermediate_result.word_count FROM read_intermediate_result('85_1'::text, 'binary'::citus_copy_format) intermediate_result(id bigint, author_id bigint, title character varying(20), word_count integer)) delete_article
+DEBUG:  Creating router plan
+DEBUG:  Plan is router executable
+ id | author_id |  title   | word_count 
+----+-----------+----------+------------
+  1 |         1 | arsenous |         10
+(1 row)
+
 -- Modifying statement in nested CTE case is covered by PostgreSQL itself
 WITH new_article AS (
     WITH nested_cte AS (
@@ -556,71 +598,36 @@ DEBUG:  Plan is router executable
 -- subqueries are supported in FROM clause but they are not router plannable
 SELECT articles_hash.id,test.word_count
 FROM articles_hash, (SELECT id, word_count FROM articles_hash) AS test WHERE test.id = articles_hash.id
-ORDER BY articles_hash.id;
-DEBUG:  join prunable for task partitionId 0 and 1
-DEBUG:  join prunable for task partitionId 0 and 2
-DEBUG:  join prunable for task partitionId 0 and 3
-DEBUG:  join prunable for task partitionId 1 and 0
-DEBUG:  join prunable for task partitionId 1 and 2
-DEBUG:  join prunable for task partitionId 1 and 3
-DEBUG:  join prunable for task partitionId 2 and 0
-DEBUG:  join prunable for task partitionId 2 and 1
-DEBUG:  join prunable for task partitionId 2 and 3
-DEBUG:  join prunable for task partitionId 3 and 0
-DEBUG:  join prunable for task partitionId 3 and 1
-DEBUG:  join prunable for task partitionId 3 and 2
-DEBUG:  pruning merge fetch taskId 1
-DETAIL:  Creating dependency on merge taskId 5
-DEBUG:  pruning merge fetch taskId 2
-DETAIL:  Creating dependency on merge taskId 5
-DEBUG:  pruning merge fetch taskId 4
-DETAIL:  Creating dependency on merge taskId 8
-DEBUG:  pruning merge fetch taskId 5
-DETAIL:  Creating dependency on merge taskId 8
-DEBUG:  pruning merge fetch taskId 7
-DETAIL:  Creating dependency on merge taskId 11
-DEBUG:  pruning merge fetch taskId 8
-DETAIL:  Creating dependency on merge taskId 11
-DEBUG:  pruning merge fetch taskId 10
-DETAIL:  Creating dependency on merge taskId 14
-DEBUG:  pruning merge fetch taskId 11
-DETAIL:  Creating dependency on merge taskId 14
-ERROR:  the query contains a join that requires repartitioning
-HINT:  Set citus.enable_repartition_joins to on to enable repartitioning
+ORDER BY test.word_count DESC, articles_hash.id LIMIT 5;
+DEBUG:  generating subplan 93_1 for subquery SELECT id, word_count FROM public.articles_hash
+DEBUG:  Plan 93 query after replacing subqueries and CTEs: SELECT articles_hash.id, test.word_count FROM public.articles_hash, (SELECT intermediate_result.id, intermediate_result.word_count FROM read_intermediate_result('93_1'::text, 'binary'::citus_copy_format) intermediate_result(id bigint, word_count integer)) test WHERE (test.id = articles_hash.id) ORDER BY test.word_count DESC, articles_hash.id LIMIT 5
+DEBUG:  push down of limit count: 5
+ id | word_count 
+----+------------
+ 50 |      19519
+ 14 |      19094
+ 48 |      18610
+ 12 |      18185
+ 46 |      17702
+(5 rows)
+
 SELECT articles_hash.id,test.word_count
 FROM articles_hash, (SELECT id, word_count FROM articles_hash) AS test 
 WHERE test.id = articles_hash.id and articles_hash.author_id = 1
 ORDER BY articles_hash.id;
-DEBUG:  join prunable for task partitionId 0 and 1
-DEBUG:  join prunable for task partitionId 0 and 2
-DEBUG:  join prunable for task partitionId 0 and 3
-DEBUG:  join prunable for task partitionId 1 and 0
-DEBUG:  join prunable for task partitionId 1 and 2
-DEBUG:  join prunable for task partitionId 1 and 3
-DEBUG:  join prunable for task partitionId 2 and 0
-DEBUG:  join prunable for task partitionId 2 and 1
-DEBUG:  join prunable for task partitionId 2 and 3
-DEBUG:  join prunable for task partitionId 3 and 0
-DEBUG:  join prunable for task partitionId 3 and 1
-DEBUG:  join prunable for task partitionId 3 and 2
-DEBUG:  pruning merge fetch taskId 1
-DETAIL:  Creating dependency on merge taskId 3
-DEBUG:  pruning merge fetch taskId 2
-DETAIL:  Creating dependency on merge taskId 5
-DEBUG:  pruning merge fetch taskId 4
-DETAIL:  Creating dependency on merge taskId 5
-DEBUG:  pruning merge fetch taskId 5
-DETAIL:  Creating dependency on merge taskId 8
-DEBUG:  pruning merge fetch taskId 7
-DETAIL:  Creating dependency on merge taskId 7
-DEBUG:  pruning merge fetch taskId 8
-DETAIL:  Creating dependency on merge taskId 11
-DEBUG:  pruning merge fetch taskId 10
-DETAIL:  Creating dependency on merge taskId 9
-DEBUG:  pruning merge fetch taskId 11
-DETAIL:  Creating dependency on merge taskId 14
-ERROR:  the query contains a join that requires repartitioning
-HINT:  Set citus.enable_repartition_joins to on to enable repartitioning
+DEBUG:  generating subplan 95_1 for subquery SELECT id, word_count FROM public.articles_hash
+DEBUG:  Plan 95 query after replacing subqueries and CTEs: SELECT articles_hash.id, test.word_count FROM public.articles_hash, (SELECT intermediate_result.id, intermediate_result.word_count FROM read_intermediate_result('95_1'::text, 'binary'::citus_copy_format) intermediate_result(id bigint, word_count integer)) test WHERE ((test.id = articles_hash.id) AND (articles_hash.author_id = 1)) ORDER BY articles_hash.id
+DEBUG:  Creating router plan
+DEBUG:  Plan is router executable
+ id | word_count 
+----+------------
+  1 |       9572
+ 11 |       1347
+ 21 |       5890
+ 31 |       7271
+ 41 |      11814
+(5 rows)
+
 -- subqueries are not supported in SELECT clause
 SELECT a.title AS name, (SELECT a2.id FROM articles_single_shard_hash a2 WHERE a.id = a2.id  LIMIT 1)
 						 AS special_price FROM articles_hash a;
@@ -725,10 +732,10 @@ SELECT a.author_id as first_author, b.word_count as second_word_count
 	WHERE a.author_id = 2 and a.author_id = b.author_id
 	LIMIT 3;
 DEBUG:  Found no worker with all shard placements
-DEBUG:  generating subplan 97_1 for CTE single_shard: SELECT id, author_id, title, word_count FROM public.articles_single_shard_hash
+DEBUG:  generating subplan 104_1 for CTE single_shard: SELECT id, author_id, title, word_count FROM public.articles_single_shard_hash
 DEBUG:  Creating router plan
 DEBUG:  Plan is router executable
-DEBUG:  Plan 97 query after replacing subqueries and CTEs: SELECT a.author_id AS first_author, b.word_count AS second_word_count FROM public.articles_hash a, (SELECT intermediate_result.id, intermediate_result.author_id, intermediate_result.title, intermediate_result.word_count FROM read_intermediate_result('97_1'::text, 'binary'::citus_copy_format) intermediate_result(id bigint, author_id bigint, title character varying(20), word_count integer)) b WHERE ((a.author_id = 2) AND (a.author_id = b.author_id)) LIMIT 3
+DEBUG:  Plan 104 query after replacing subqueries and CTEs: SELECT a.author_id AS first_author, b.word_count AS second_word_count FROM public.articles_hash a, (SELECT intermediate_result.id, intermediate_result.author_id, intermediate_result.title, intermediate_result.word_count FROM read_intermediate_result('104_1'::text, 'binary'::citus_copy_format) intermediate_result(id bigint, author_id bigint, title character varying(20), word_count integer)) b WHERE ((a.author_id = 2) AND (a.author_id = b.author_id)) LIMIT 3
 DEBUG:  Creating router plan
 DEBUG:  Plan is router executable
  first_author | second_word_count 
@@ -1299,12 +1306,12 @@ SELECT id, MIN(id) over (order by word_count)
 	FROM articles_hash
 	WHERE author_id = 1 or author_id = 2;
 ERROR:  could not run distributed query because the window function that is used cannot be pushed down
-HINT:  Window functions are supported in two ways. Either add an equality filter on the distributed tables' partition column or use the window functions inside a subquery with a PARTITION BY clause containing the distribution column
+HINT:  Window functions are supported in two ways. Either add an equality filter on the distributed tables' partition column or use the window functions with a PARTITION BY clause containing the distribution column
 SELECT LAG(title, 1) over (ORDER BY word_count) prev, title, word_count 
 	FROM articles_hash
 	WHERE author_id = 5 or author_id = 2;
 ERROR:  could not run distributed query because the window function that is used cannot be pushed down
-HINT:  Window functions are supported in two ways. Either add an equality filter on the distributed tables' partition column or use the window functions inside a subquery with a PARTITION BY clause containing the distribution column
+HINT:  Window functions are supported in two ways. Either add an equality filter on the distributed tables' partition column or use the window functions with a PARTITION BY clause containing the distribution column
 -- where false queries are router plannable
 SELECT * 
 	FROM articles_hash
@@ -1660,31 +1667,81 @@ DEBUG:  Plan is router executable
 ----+-----------+-------+------------+------+----
 (0 rows)
 
--- multi-shard join is not router plannable
-SELECT * FROM articles_range ar join authors_range au on (ar.author_id = au.id)
+-- This query was intended to test "multi-shard join is not router plannable"
+-- To run it using repartition join logic we change the join columns
+SET citus.task_executor_type to "task-tracker";
+SELECT * FROM articles_range ar join authors_range au on (ar.title = au.name)
 	WHERE ar.author_id = 35;
-DEBUG:  join prunable for intervals [21,40] and [1,10]
-DEBUG:  join prunable for intervals [31,40] and [1,10]
-DEBUG:  join prunable for intervals [31,40] and [11,30]
+DEBUG:  join prunable for task partitionId 0 and 1
+DEBUG:  join prunable for task partitionId 0 and 2
+DEBUG:  join prunable for task partitionId 0 and 3
+DEBUG:  join prunable for task partitionId 1 and 0
+DEBUG:  join prunable for task partitionId 1 and 2
+DEBUG:  join prunable for task partitionId 1 and 3
+DEBUG:  join prunable for task partitionId 2 and 0
+DEBUG:  join prunable for task partitionId 2 and 1
+DEBUG:  join prunable for task partitionId 2 and 3
+DEBUG:  join prunable for task partitionId 3 and 0
+DEBUG:  join prunable for task partitionId 3 and 1
+DEBUG:  join prunable for task partitionId 3 and 2
+DEBUG:  pruning merge fetch taskId 1
+DETAIL:  Creating dependency on merge taskId 3
+DEBUG:  pruning merge fetch taskId 2
+DETAIL:  Creating dependency on merge taskId 5
+DEBUG:  pruning merge fetch taskId 4
+DETAIL:  Creating dependency on merge taskId 6
+DEBUG:  pruning merge fetch taskId 5
+DETAIL:  Creating dependency on merge taskId 10
+DEBUG:  pruning merge fetch taskId 7
+DETAIL:  Creating dependency on merge taskId 9
+DEBUG:  pruning merge fetch taskId 8
+DETAIL:  Creating dependency on merge taskId 15
+DEBUG:  pruning merge fetch taskId 10
+DETAIL:  Creating dependency on merge taskId 12
+DEBUG:  pruning merge fetch taskId 11
+DETAIL:  Creating dependency on merge taskId 20
  id | author_id | title | word_count | name | id 
 ----+-----------+-------+------------+------+----
 (0 rows)
 
--- this is a bug, it is a single shard join query but not router plannable
-SELECT * FROM articles_range ar join authors_range au on (ar.author_id = au.id) 
+-- This query was intended to test "this is a bug, it is a single shard join
+-- query but not router plannable". To run it using repartition join logic we
+-- change the join columns.
+SELECT * FROM articles_range ar join authors_range au on (ar.title = au.name) 
 	WHERE ar.author_id = 1 or au.id = 5;
-DEBUG:  join prunable for intervals [1,10] and [11,30]
-DEBUG:  join prunable for intervals [1,10] and [21,40]
-DEBUG:  join prunable for intervals [1,10] and [31,40]
-DEBUG:  join prunable for intervals [11,30] and [1,10]
-DEBUG:  join prunable for intervals [11,30] and [31,40]
-DEBUG:  join prunable for intervals [21,40] and [1,10]
-DEBUG:  join prunable for intervals [31,40] and [1,10]
-DEBUG:  join prunable for intervals [31,40] and [11,30]
+DEBUG:  join prunable for task partitionId 0 and 1
+DEBUG:  join prunable for task partitionId 0 and 2
+DEBUG:  join prunable for task partitionId 0 and 3
+DEBUG:  join prunable for task partitionId 1 and 0
+DEBUG:  join prunable for task partitionId 1 and 2
+DEBUG:  join prunable for task partitionId 1 and 3
+DEBUG:  join prunable for task partitionId 2 and 0
+DEBUG:  join prunable for task partitionId 2 and 1
+DEBUG:  join prunable for task partitionId 2 and 3
+DEBUG:  join prunable for task partitionId 3 and 0
+DEBUG:  join prunable for task partitionId 3 and 1
+DEBUG:  join prunable for task partitionId 3 and 2
+DEBUG:  pruning merge fetch taskId 1
+DETAIL:  Creating dependency on merge taskId 5
+DEBUG:  pruning merge fetch taskId 2
+DETAIL:  Creating dependency on merge taskId 5
+DEBUG:  pruning merge fetch taskId 4
+DETAIL:  Creating dependency on merge taskId 10
+DEBUG:  pruning merge fetch taskId 5
+DETAIL:  Creating dependency on merge taskId 10
+DEBUG:  pruning merge fetch taskId 7
+DETAIL:  Creating dependency on merge taskId 15
+DEBUG:  pruning merge fetch taskId 8
+DETAIL:  Creating dependency on merge taskId 15
+DEBUG:  pruning merge fetch taskId 10
+DETAIL:  Creating dependency on merge taskId 20
+DEBUG:  pruning merge fetch taskId 11
+DETAIL:  Creating dependency on merge taskId 20
  id | author_id | title | word_count | name | id 
 ----+-----------+-------+------------+------+----
 (0 rows)
 
+RESET citus.task_executor_type;
 -- bogus query, join on non-partition column, but router plannable due to filters
 SELECT * FROM articles_range ar join authors_range au on (ar.id = au.id) 
 	WHERE ar.author_id = 1 and au.id < 10;
@@ -1719,21 +1776,21 @@ DEBUG:  join prunable for intervals [21,40] and [1,10]
 DEBUG:  join prunable for intervals [31,40] and [1,10]
 DEBUG:  join prunable for intervals [31,40] and [11,30]
 DEBUG:  pruning merge fetch taskId 1
-DETAIL:  Creating dependency on merge taskId 3
-DEBUG:  pruning merge fetch taskId 4
-DETAIL:  Creating dependency on merge taskId 5
+DETAIL:  Creating dependency on merge taskId 2
+DEBUG:  pruning merge fetch taskId 3
+DETAIL:  Creating dependency on merge taskId 4
+DEBUG:  pruning merge fetch taskId 5
+DETAIL:  Creating dependency on merge taskId 4
 DEBUG:  pruning merge fetch taskId 7
-DETAIL:  Creating dependency on merge taskId 5
-DEBUG:  pruning merge fetch taskId 10
-DETAIL:  Creating dependency on merge taskId 7
+DETAIL:  Creating dependency on merge taskId 6
+DEBUG:  pruning merge fetch taskId 9
+DETAIL:  Creating dependency on merge taskId 6
+DEBUG:  pruning merge fetch taskId 11
+DETAIL:  Creating dependency on merge taskId 6
 DEBUG:  pruning merge fetch taskId 13
-DETAIL:  Creating dependency on merge taskId 7
-DEBUG:  pruning merge fetch taskId 16
-DETAIL:  Creating dependency on merge taskId 7
-DEBUG:  pruning merge fetch taskId 19
-DETAIL:  Creating dependency on merge taskId 9
-DEBUG:  pruning merge fetch taskId 22
-DETAIL:  Creating dependency on merge taskId 9
+DETAIL:  Creating dependency on merge taskId 8
+DEBUG:  pruning merge fetch taskId 15
+DETAIL:  Creating dependency on merge taskId 8
 ERROR:  the query contains a join that requires repartitioning
 HINT:  Set citus.enable_repartition_joins to on to enable repartitioning
 -- join between a range partitioned table and reference table is router plannable
@@ -1787,7 +1844,7 @@ WARNING:  relation "public.articles_append" does not exist
 CONTEXT:  while executing command on localhost:57638
 WARNING:  relation "public.articles_append" does not exist
 CONTEXT:  while executing command on localhost:57638
-ERROR:  failed to execute task 2
+ERROR:  failed to execute task 1
 -- same query with where false but evaluation left to worker
 SELECT author_id FROM articles_append
 	WHERE 
@@ -1802,7 +1859,7 @@ WARNING:  relation "public.articles_append" does not exist
 CONTEXT:  while executing command on localhost:57638
 WARNING:  relation "public.articles_append" does not exist
 CONTEXT:  while executing command on localhost:57638
-ERROR:  failed to execute task 2
+ERROR:  failed to execute task 1
 -- same query on router planner with where false but evaluation left to worker
 SELECT author_id FROM articles_single_shard_hash
 	WHERE 
@@ -1902,7 +1959,8 @@ SELECT
 	FROM
 		articles_hash
  	GROUP BY
-		author_id;
+		author_id
+	ORDER BY c;
  c 
 ---
  4

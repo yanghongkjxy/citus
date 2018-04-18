@@ -50,7 +50,8 @@ CREATE OPERATOR citus_mx_test_schema.=== (
 );
 
 SET search_path TO public;
-CREATE COLLATION citus_mx_test_schema.english FROM "en_US";
+SELECT quote_ident(current_setting('lc_collate')) as current_locale \gset
+CREATE COLLATION citus_mx_test_schema.english (LOCALE=:current_locale);
 
 CREATE TYPE citus_mx_test_schema.new_composite_type as (key1 text, key2 text);
 CREATE TYPE order_side_mx AS ENUM ('buy', 'sell');
@@ -101,7 +102,7 @@ CREATE OPERATOR citus_mx_test_schema.=== (
 );
 
 SET search_path TO public;
-CREATE COLLATION citus_mx_test_schema.english FROM "en_US";
+CREATE COLLATION citus_mx_test_schema.english (LOCALE=:current_locale);
 
 SET search_path TO public;
 CREATE TYPE citus_mx_test_schema.new_composite_type as (key1 text, key2 text);
@@ -155,7 +156,7 @@ CREATE OPERATOR citus_mx_test_schema.=== (
 
 
 SET search_path TO public;
-CREATE COLLATION citus_mx_test_schema.english FROM "en_US";
+CREATE COLLATION citus_mx_test_schema.english (LOCALE=:current_locale);
 
 SET search_path TO public;
 CREATE TYPE citus_mx_test_schema.new_composite_type as (key1 text, key2 text);
@@ -306,8 +307,7 @@ CREATE TABLE customer_mx (
     c_mktsegment char(10) not null,
     c_comment varchar(117) not null);
 
-SET citus.shard_count TO 1;
-SELECT create_distributed_table('customer_mx', 'c_custkey');
+SELECT create_reference_table('customer_mx');
 
 CREATE TABLE nation_mx (
     n_nationkey integer not null,
@@ -315,7 +315,7 @@ CREATE TABLE nation_mx (
     n_regionkey integer not null,
     n_comment varchar(152));
 
-SELECT create_distributed_table('nation_mx', 'n_nationkey');
+SELECT create_reference_table('nation_mx');
 
 CREATE TABLE part_mx (
     p_partkey integer not null,
@@ -328,7 +328,7 @@ CREATE TABLE part_mx (
     p_retailprice decimal(15,2) not null,
     p_comment varchar(23) not null);
 
-SELECT create_distributed_table('part_mx', 'p_partkey');
+SELECT create_reference_table('part_mx');
 
 CREATE TABLE supplier_mx
 (
@@ -341,7 +341,7 @@ CREATE TABLE supplier_mx
     s_comment varchar(101) not null
 );
 
-SELECT create_distributed_table('supplier_mx', 's_suppkey');
+SELECT create_reference_table('supplier_mx');
 
 -- Create test table for ddl
 CREATE TABLE mx_ddl_table (

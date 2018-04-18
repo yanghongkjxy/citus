@@ -58,31 +58,14 @@ IsResponseOK(PGresult *result)
  * ForgetResults clears a connection from pending activity.
  *
  * Note that this might require network IO. If that's not acceptable, use
- * NonblockingForgetResults().
+ * ClearResultsIfReady().
  *
  * ClearResults is variant of this function which can also raise errors.
  */
 void
 ForgetResults(MultiConnection *connection)
 {
-	while (true)
-	{
-		PGresult *result = NULL;
-		const bool dontRaiseErrors = false;
-
-		result = GetRemoteCommandResult(connection, dontRaiseErrors);
-		if (result == NULL)
-		{
-			break;
-		}
-		if (PQresultStatus(result) == PGRES_COPY_IN)
-		{
-			PQputCopyEnd(connection->pgConn, NULL);
-
-			/* TODO: mark transaction as failed, once we can. */
-		}
-		PQclear(result);
-	}
+	ClearResults(connection, false);
 }
 
 
@@ -93,7 +76,7 @@ ForgetResults(MultiConnection *connection)
  * is marked critical.
  *
  * Note that this might require network IO. If that's not acceptable, use
- * NonblockingForgetResults().
+ * ClearResultsIfReady().
  */
 bool
 ClearResults(MultiConnection *connection, bool raiseErrors)
@@ -123,6 +106,14 @@ ClearResults(MultiConnection *connection, bool raiseErrors)
 			MarkRemoteTransactionFailed(connection, raiseErrors);
 
 			success = false;
+
+			/* an error happened, there is nothing we can do more */
+			if (PQresultStatus(result) == PGRES_FATAL_ERROR)
+			{
+				PQclear(result);
+
+				break;
+			}
 		}
 
 		PQclear(result);
@@ -133,12 +124,12 @@ ClearResults(MultiConnection *connection, bool raiseErrors)
 
 
 /*
- * NonblockingForgetResults clears a connection from pending activity if doing
+ * ClearResultsIfReady clears a connection from pending activity if doing
  * so does not require network IO. Returns true if successful, false
  * otherwise.
  */
 bool
-NonblockingForgetResults(MultiConnection *connection)
+ClearResultsIfReady(MultiConnection *connection)
 {
 	PGconn *pgConn = connection->pgConn;
 
@@ -152,9 +143,7 @@ NonblockingForgetResults(MultiConnection *connection)
 	while (true)
 	{
 		PGresult *result = NULL;
-
-		/* just in case there's a lot of results */
-		CHECK_FOR_INTERRUPTS();
+		ExecStatusType resultStatus;
 
 		/*
 		 * If busy, there might still be results already received and buffered
@@ -182,19 +171,31 @@ NonblockingForgetResults(MultiConnection *connection)
 		}
 
 		result = PQgetResult(pgConn);
-		if (PQresultStatus(result) == PGRES_COPY_IN ||
-			PQresultStatus(result) == PGRES_COPY_OUT)
+		if (result == NULL)
+		{
+			/* no more results available */
+			return true;
+		}
+
+		resultStatus = PQresultStatus(result);
+
+		/* only care about the status, can clear now */
+		PQclear(result);
+
+		if (resultStatus == PGRES_COPY_IN || resultStatus == PGRES_COPY_OUT)
 		{
 			/* in copy, can't reliably recover without blocking */
 			return false;
 		}
 
-		if (result == NULL)
+		if (!(resultStatus == PGRES_SINGLE_TUPLE || resultStatus == PGRES_TUPLES_OK ||
+			  resultStatus == PGRES_COMMAND_OK))
 		{
-			return true;
+			/* an error occcurred just when we were aborting */
+			return false;
 		}
 
-		PQclear(result);
+		/* check if there are more results to consume */
 	}
 
 	pg_unreachable();
@@ -540,6 +541,12 @@ GetRemoteCommandResult(MultiConnection *connection, bool raiseInterrupts)
 
 	if (!FinishConnectionIO(connection, raiseInterrupts))
 	{
+		/* some error(s) happened while doing the I/O, signal the callers */
+		if (PQstatus(pgConn) == CONNECTION_BAD)
+		{
+			return PQmakeEmptyPGresult(pgConn, PGRES_FATAL_ERROR);
+		}
+
 		return NULL;
 	}
 
@@ -744,9 +751,10 @@ WaitForAllConnections(List *connectionList, bool raiseInterrupts)
 	int connectionIndex = 0;
 	ListCell *connectionCell = NULL;
 
-	MultiConnection *allConnections[totalConnectionCount];
-	WaitEvent events[totalConnectionCount];
-	bool connectionReady[totalConnectionCount];
+	MultiConnection **allConnections =
+		palloc(totalConnectionCount * sizeof(MultiConnection *));
+	WaitEvent *events = palloc(totalConnectionCount * sizeof(WaitEvent));
+	bool *connectionReady = palloc(totalConnectionCount * sizeof(bool));
 	WaitEventSet *waitEventSet = NULL;
 
 	/* convert connection list to an array such that we can move items around */
@@ -760,8 +768,7 @@ WaitForAllConnections(List *connectionList, bool raiseInterrupts)
 	}
 
 	/* make an initial pass to check for failed and idle connections */
-	for (connectionIndex = pendingConnectionsStartIndex;
-		 connectionIndex < totalConnectionCount; connectionIndex++)
+	for (connectionIndex = 0; connectionIndex < totalConnectionCount; connectionIndex++)
 	{
 		MultiConnection *connection = allConnections[connectionIndex];
 
@@ -948,6 +955,10 @@ WaitForAllConnections(List *connectionList, bool raiseInterrupts)
 			FreeWaitEventSet(waitEventSet);
 			waitEventSet = NULL;
 		}
+
+		pfree(allConnections);
+		pfree(events);
+		pfree(connectionReady);
 	}
 	PG_CATCH();
 	{
@@ -957,6 +968,10 @@ WaitForAllConnections(List *connectionList, bool raiseInterrupts)
 			FreeWaitEventSet(waitEventSet);
 			waitEventSet = NULL;
 		}
+
+		pfree(allConnections);
+		pfree(events);
+		pfree(connectionReady);
 
 		PG_RE_THROW();
 	}
@@ -977,13 +992,23 @@ BuildWaitEventSet(MultiConnection **allConnections, int totalConnectionCount,
 	WaitEventSet *waitEventSet = NULL;
 	int connectionIndex = 0;
 
+	/*
+	 * subtract 3 to make room for WL_POSTMASTER_DEATH, WL_LATCH_SET, and
+	 * pgwin32_signal_event.
+	 */
+	if (pendingConnectionCount > FD_SETSIZE - 3)
+	{
+		pendingConnectionCount = FD_SETSIZE - 3;
+	}
+
 	/* allocate pending connections + 2 for the signal latch and postmaster death */
+	/* (CreateWaitEventSet makes room for pgwin32_signal_event automatically) */
 	waitEventSet = CreateWaitEventSet(CurrentMemoryContext, pendingConnectionCount + 2);
 
-	for (connectionIndex = pendingConnectionsStartIndex;
-		 connectionIndex < totalConnectionCount; connectionIndex++)
+	for (connectionIndex = 0; connectionIndex < pendingConnectionCount; connectionIndex++)
 	{
-		MultiConnection *connection = allConnections[connectionIndex];
+		MultiConnection *connection = allConnections[pendingConnectionsStartIndex +
+													 connectionIndex];
 		int socket = PQsocket(connection->pgConn);
 
 		/*
